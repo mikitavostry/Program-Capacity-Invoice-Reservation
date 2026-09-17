@@ -43,6 +43,28 @@ The API listens on `http://localhost:3000` (override with `PORT`).
 | `npm run lint`     | Lint `src/` and `test/`        |
 | `npm run format`   | Format with Prettier           |
 
+## Architecture
+
+Domain-driven design, layered so the domain depends on nothing: presentation and
+infrastructure both point inward at the application layer, which points at the domain.
+Adapters implement ports the domain declares.
+
+See **[docs/architecture.md](docs/architecture.md)** for the full model, the reasoning, and
+the trade-offs behind each choice. In brief:
+
+| Decision | Chosen |
+| --- | --- |
+| Persistence | PostgreSQL + Prisma, explicit domain-to-row mappers |
+| Application layer | `@nestjs/cqrs` command and query buses |
+| Aggregates | `Program` and `Reservation` as separate roots, written in one transaction |
+| Concurrency | Optimistic version column with bounded retry |
+| Currency | Convert on reservation, snapshot the rate, replay it on release |
+| Rounding | Round up — the reserved amount is a risk exposure hold, not a settlement figure |
+| Auth | JWT bearer with a default-deny global guard |
+
+Kafka ingestion from the treasury system is deferred; the seam it attaches to is described
+in §12 of the architecture document.
+
 ## Notes and trade-offs
 
 - **Use `npm ci`, not a from-scratch `npm install`.** npm 10.9.3 (bundled with Node 22.19)
