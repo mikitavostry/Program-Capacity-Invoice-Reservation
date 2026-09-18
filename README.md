@@ -5,8 +5,8 @@ capacity when approved for early payment, and release it back when repaid. Capac
 also arrives from an external treasury system over Kafka, including periodic bulk
 reconciliation messages. Programs and invoices may be denominated in different currencies.
 
-> Status: domain model, persistence and application layer are implemented and tested; the
-> HTTP API and authentication are next.
+> Status: complete and runnable, apart from the Kafka treasury feed, which is deferred by
+> agreement; the seam it attaches to is described in the architecture document.
 
 ## Stack
 
@@ -28,28 +28,58 @@ Because the project is ESM, relative imports must carry a `.js` extension
 Requires Docker, for Postgres.
 
 ```bash
-cp .env.example .env     # local credentials; matches docker-compose.yml
+cp .env.example .env     # local settings; matches docker-compose.yml
 npm ci                   # also generates the Prisma client
 npm run db:up            # Postgres on localhost:5433, waits until healthy
 npm run db:migrate       # apply migrations
-npm run start:dev
+npm run start:dev        # http://localhost:3000
 ```
-
-The API listens on `http://localhost:3000` (override with `PORT`).
 
 Postgres is published on **5433**, not 5432, so it does not collide with a Postgres already
 installed on the machine. To change it, set `POSTGRES_PORT` and both URLs in `.env` together.
 
+### Calling the API
+
+Every endpoint except `/health/*` needs a bearer token. Mint one for local use:
+
+```bash
+TOKEN=$(npm run token --silent)          # every scope, every program
+```
+
+`npm run token -- --scope capacity:read --programs program-1` narrows it. Then:
+
+```bash
+# Open a program (admin)
+curl -X POST localhost:3000/programs -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json'   -d '{"programId":"program-1","creditLimit":{"amount":"10000000.00","currency":"USD"}}'
+
+# Reserve capacity for an invoice — in another currency, converted at today's rate
+curl -X POST localhost:3000/programs/program-1/reservations -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json'   -d '{"invoiceId":"invoice-1","amount":{"amount":"100000.00","currency":"EUR"}}'
+
+# Record a partial repayment (omit "amount" to repay whatever is outstanding)
+curl -X POST localhost:3000/programs/program-1/reservations/invoice-1/repayments   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json'   -d '{"repaymentId":"repayment-1","amount":{"amount":"40000.00","currency":"EUR"}}'
+
+# Current availability, and the reservations behind it
+curl localhost:3000/programs/program-1/capacity -H "Authorization: Bearer $TOKEN"
+curl 'localhost:3000/programs/program-1/reservations?limit=20' -H "Authorization: Bearer $TOKEN"
+```
+
+Amounts are always `{"amount": "<decimal string>", "currency": "<ISO 4217>"}` — strings, never
+JSON numbers, which cannot carry money exactly. Errors come back as RFC 9457
+`application/problem+json` with a stable `code`; the full list is in the
+[architecture document](docs/architecture.md#10-http-api).
+
 ### Tests
 
 ```bash
-npm test                 # unit — pure, no infrastructure, under a second or so
-npm run test:int         # integration — needs `npm run db:up`
+npm test                 # unit — pure, no infrastructure
+npm run test:int         # integration — real Postgres; needs `npm run db:up`
+npm run test:e2e         # end to end — the whole app over HTTP; needs `npm run db:up`
 ```
 
-The integration suite runs against a separate `capacity_test` database that it drops and
-rebuilds from the migrations on every run. It refuses to start against any database whose
-name does not contain `test`, so it cannot be pointed at real data by mistake.
+The integration and end-to-end suites run against a separate `capacity_test` database that
+is dropped and rebuilt from the migrations on every run. They refuse to start against any
+database whose name does not contain `test`, so they cannot be pointed at real data by
+mistake.
 
 ## Scripts
 
@@ -61,7 +91,8 @@ name does not contain `test`, so it cannot be pointed at real data by mistake.
 | `npm test`         | Unit tests                     |
 | `npm run test:int` | Integration tests (real Postgres) |
 | `npm run test:cov` | Unit tests with coverage       |
-| `npm run test:e2e` | End-to-end tests               |
+| `npm run test:e2e` | End-to-end tests over HTTP (real Postgres) |
+| `npm run token`    | Mint a local bearer token      |
 | `npm run lint`     | Lint `src/` and `test/`        |
 | `npm run typecheck`| Type-check everything, tests included |
 | `npm run format`   | Format with Prettier           |

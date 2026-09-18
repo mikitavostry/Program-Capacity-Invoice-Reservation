@@ -1,0 +1,109 @@
+import {
+  ForbiddenException,
+  Injectable,
+  Logger,
+  UnauthorizedException,
+  type CanActivate,
+  type ExecutionContext,
+} from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+import { IS_PUBLIC, REQUIRED_SCOPES, type AuthenticatedRequest } from './decorators.js';
+import { canAccessProgram, type Scope } from './principal.js';
+import { InvalidTokenError, TokenVerifier } from './token-verifier.js';
+
+interface HttpRequest extends AuthenticatedRequest {
+  headers: Record<string, string | string[] | undefined>;
+  params?: Record<string, string>;
+  method: string;
+  url: string;
+}
+
+function isPublic(reflector: Reflector, context: ExecutionContext): boolean {
+  return (
+    reflector.getAllAndOverride<boolean>(IS_PUBLIC, [context.getHandler(), context.getClass()]) ===
+    true
+  );
+}
+
+/** Establishes who is calling. Registered globally: every route runs it unless `@Public()`. */
+@Injectable()
+export class AuthenticationGuard implements CanActivate {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly tokens: TokenVerifier,
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    if (isPublic(this.reflector, context)) return true;
+
+    const request = context.switchToHttp().getRequest<HttpRequest>();
+    const token = bearerToken(request.headers['authorization']);
+    if (token === null) throw new UnauthorizedException('A bearer token is required.');
+
+    try {
+      request.principal = await this.tokens.verify(token);
+    } catch (error) {
+      if (error instanceof InvalidTokenError) {
+        // The reason goes to the logs, not the caller: telling an attacker exactly which check
+        // failed helps them more than it helps a legitimate client.
+        throw new UnauthorizedException('The bearer token is not valid.', { cause: error });
+      }
+      throw error;
+    }
+
+    return true;
+  }
+}
+
+/**
+ * Decides whether the caller may do this. Registered globally after authentication.
+ *
+ * Two rules, both default-deny: the route must declare the scopes it needs, and any route
+ * addressing a program by `:programId` is checked against the programs the caller may touch.
+ * That second check needs no code in the controller, so no controller can forget it.
+ */
+@Injectable()
+export class AuthorizationGuard implements CanActivate {
+  private readonly logger = new Logger(AuthorizationGuard.name);
+
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    if (isPublic(this.reflector, context)) return true;
+
+    const request = context.switchToHttp().getRequest<HttpRequest>();
+    const principal = request.principal;
+    if (principal === undefined) throw new UnauthorizedException('A bearer token is required.');
+
+    const required = this.reflector.getAllAndOverride<Scope[] | undefined>(REQUIRED_SCOPES, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    if (required === undefined) {
+      this.logger.error(
+        `${request.method} ${request.url} declares no required scopes and is refused; add @RequireScopes or @Public.`,
+      );
+      throw new ForbiddenException('This operation is not permitted.');
+    }
+
+    const missing = required.filter((scope) => !principal.scopes.has(scope));
+    if (missing.length > 0) {
+      throw new ForbiddenException(`This operation requires the scope ${missing.join(', ')}.`);
+    }
+
+    const programId = request.params?.['programId'];
+    if (programId !== undefined && !canAccessProgram(principal, programId)) {
+      throw new ForbiddenException(`The caller may not act on program ${programId}.`);
+    }
+
+    return true;
+  }
+}
+
+function bearerToken(header: string | string[] | undefined): string | null {
+  if (typeof header !== 'string') return null;
+
+  const match = /^Bearer\s+(\S+)\s*$/i.exec(header);
+  return match === null ? null : match[1];
+}

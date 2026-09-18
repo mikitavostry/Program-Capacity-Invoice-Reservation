@@ -1,8 +1,31 @@
+import { existsSync } from 'node:fs';
+import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module.js';
+import { ConfigError, loadConfig } from './platform/config/app-config.js';
+import { APP_OPTIONS, configureApp } from './platform/http/configure-app.js';
 
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  await app.listen(process.env.PORT ?? 3000);
+async function bootstrap(): Promise<void> {
+  // Locally, `.env` supplies the configuration. In production the environment does, and a
+  // stray file on the host must not quietly override it.
+  if (process.env['NODE_ENV'] !== 'production' && existsSync('.env')) {
+    process.loadEnvFile('.env');
+  }
+
+  const config = loadConfig();
+  const app = configureApp(await NestFactory.create(AppModule.register(config), APP_OPTIONS));
+
+  await app.listen(config.port);
+  new Logger('Bootstrap').log(`Listening on port ${config.port} (${config.environment})`);
 }
-await bootstrap();
+
+try {
+  await bootstrap();
+} catch (error) {
+  // A configuration problem is an operator's to fix: say what is wrong, without a stack trace.
+  if (error instanceof ConfigError) {
+    console.error(error.message);
+    process.exit(1);
+  }
+  throw error;
+}

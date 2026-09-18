@@ -13,8 +13,8 @@
     "db:migrate": "prisma migrate deploy",
     "db:migrate:dev": "prisma migrate dev",
     "db:up": "docker compose up -d --wait",
-    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
-    "lint": "oxlint src/ test/",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\"",
+    "lint": "oxlint src/ test/ scripts/",
     "postinstall": "prisma generate",
     "start": "nest start",
     "start:debug": "nest start --debug --watch",
@@ -26,6 +26,7 @@
     "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
     "test:int": "vitest run --config ./vitest.config.int.ts",
     "test:watch": "vitest",
+    "token": "node --disable-warning=ExperimentalWarning scripts/issue-dev-token.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
@@ -35,9 +36,12 @@
     "@nestjs/platform-express": "^12.0.1",
     "@prisma/adapter-pg": "7.10.0",
     "@prisma/client": "7.10.0",
+    "express": "5.2.1",
+    "jose": "^6.2.12",
     "pg": "8.23.0",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@nestjs/cli": "^12.0.0",

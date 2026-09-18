@@ -66,10 +66,10 @@ src/
 │     ├─ infrastructure/
 │     │  ├─ persistence/prisma/   repositories, mappers, ledger, read model, transaction runner
 │     │  └─ fx/                   static rate provider (stand-in for a real FX service)
-│     ├─ presentation/http/       controller, request/response DTOs, error filter
+│     ├─ presentation/http/       controllers, zod schemas, presenters, error statuses
 │     └─ capacity.module.ts
-├─ iam/                    JWT guard, @Public(), program-scope authorization
-├─ platform/               config + env validation, PrismaService, logging
+├─ iam/                    token verifier, authentication + authorization guards, @Public
+├─ platform/               config, Prisma client, problem-details filter, logging, health
 ├─ app.module.ts
 └─ main.ts
 ```
@@ -407,44 +407,95 @@ the system as a whole.
 
 ## 10. HTTP API
 
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /programs` | open a program (admin scope) |
-| `GET /programs/:programId/capacity` | credit limit, reserved, available, currency |
-| `POST /programs/:programId/reservations` | reserve capacity for an invoice |
-| `POST /programs/:programId/reservations/:invoiceId/repayments` | record a full or partial repayment |
-| `GET /programs/:programId/reservations` | paged reservations with repayment state |
+| Endpoint | Scope | Success |
+| --- | --- | --- |
+| `POST /programs` | `programs:admin` | 201 opened · 200 identical repeat |
+| `GET /programs/:programId/capacity` | `capacity:read` | 200 |
+| `POST /programs/:programId/reservations` | `capacity:write` | 201 reserved · 200 identical repeat |
+| `GET /programs/:programId/reservations?status=&limit=&cursor=` | `capacity:read` | 200, keyset-paged |
+| `POST /programs/:programId/reservations/:invoiceId/repayments` | `capacity:write` | 201 applied · 200 replayed id |
+| `GET /health/live`, `GET /health/ready` | none | 200 · 503 when the database is unreachable |
 
 A repayment is a `POST` that creates a record, not a `DELETE` of the reservation — nothing is
-deleted. The body carries the caller's `repaymentId` and, optionally, an amount; omitting
-the amount repays whatever is outstanding.
+deleted. Its body carries the caller's `repaymentId` and optionally an amount; omitting it
+repays whatever is outstanding. The status code distinguishes a first application (201) from
+a recognised repeat (200), so a client can tell without comparing bodies.
 
-All routes are authenticated by a globally registered JWT guard, with an explicit
-`@Public()` decorator as the only opt-out, so a newly added endpoint is protected by default
-rather than by remembering to protect it. Claims carry the caller's program scope, checked
-before any program is touched.
+### 10.1 Authentication and authorization
 
-Domain errors are translated in a single exception filter against a stable error-code
-taxonomy:
+Bearer JWTs, HS256, verified with the algorithm pinned — a token cannot choose its own, so
+`alg: none` and algorithm-substitution tokens are refused — and with issuer, audience and
+expiry all checked. Callers are told only that a token is invalid; which check failed goes
+to the log, because the precise reason helps an attacker more than a legitimate client.
+
+Two guards, both registered globally and both **default-deny**:
+
+- **Authentication** runs on every route unless it is marked `@Public()` — only the health
+  probes are. A new endpoint is protected unless someone decides otherwise.
+- **Authorization** requires every authenticated route to declare `@RequireScopes(...)`; a
+  route that forgets is refused, not opened. It then checks any `:programId` in the path
+  against the token's `programs` claim — `"*"` or a list of ids — with no code in the
+  controller, so no controller can forget. A token without a `programs` claim may touch no
+  program at all: blanket access has to be granted explicitly.
+
+**Trade-off.** A shared secret keeps local runs self-contained. Behind a real identity
+provider the verifier would check asymmetric tokens against its JWKS instead; with `jose`
+that changes how the key is obtained and nothing else, and it is confined to one class.
+
+### 10.2 Input
+
+Bodies and query strings are parsed with zod straight into domain values, so a request that
+passes validation already holds `Money`. Amounts must be decimal *strings* — a JSON number has
+been through a binary float before the service sees it. Objects are strict: in a money API a
+misspelt `ammount` silently ignored is worse than one refused. Ids are limited to URL-safe
+characters. Bodies over 16 KB are refused; the largest legitimate one is a few hundred bytes.
+
+### 10.3 Errors
+
+Every error is RFC 9457 `application/problem+json` with a stable `code` to branch on, a
+`detail` for people, and structured fields where a client would otherwise parse prose — an
+`INSUFFICIENT_CAPACITY` carries `requested` and `available`; a validation failure lists every
+issue with its path, not just the first. 401s carry `WWW-Authenticate`; `CAPACITY_BUSY`
+carries `Retry-After`.
 
 | Code | Status |
 | --- | --- |
+| `VALIDATION_FAILED` / `MALFORMED_JSON` / `INVALID_QUERY` | 400 |
+| `UNAUTHENTICATED` | 401 |
+| `FORBIDDEN` | 403 |
+| `PROGRAM_NOT_FOUND` / `RESERVATION_NOT_FOUND` / `NOT_FOUND` | 404 |
 | `INSUFFICIENT_CAPACITY` | 409 |
 | `PROGRAM_NOT_ACTIVE` | 409 |
 | `PROGRAM_ALREADY_EXISTS` | 409 |
 | `INVOICE_ALREADY_RESERVED` | 409 |
 | `RESERVATION_ALREADY_RELEASED` | 409 |
 | `REPAYMENT_ID_REUSED` | 409 |
-| `PROGRAM_NOT_FOUND` / `RESERVATION_NOT_FOUND` | 404 |
+| `PAYLOAD_TOO_LARGE` | 413 |
 | `INVALID_AMOUNT` | 422 |
-| `INVALID_QUERY` | 400 |
 | `REPAYMENT_EXCEEDS_OUTSTANDING` | 422 |
 | `REPAYMENT_CURRENCY_MISMATCH` | 422 |
 | `CURRENCY_NOT_CONVERTIBLE` / `UNSUPPORTED_CURRENCY` | 422 |
+| `INTERNAL_ERROR` | 500 — includes `INVARIANT_VIOLATION`; never the caller's fault |
 | `CAPACITY_BUSY` (lock timeout) | 503 with `Retry-After` |
-| `INVARIANT_VIOLATION` | 500 — never the caller's fault |
+
+409 means the request conflicts with current state, so resending it unchanged will not help;
+422 means the request itself carries a value the rules reject. A 500 says nothing about its
+cause in the response — the details go to the log. An error code that no table maps is also
+a 500, so a newly added domain error cannot leak through as something a client might retry.
 
 The domain layer never mentions HTTP status codes.
+
+### 10.4 Operations
+
+- **Configuration** is read from the environment and validated before Nest starts, reporting
+  every problem at once. In production it refuses the example JWT secret and requires real
+  exchange rates rather than the built-in development table.
+- **Health**: `/health/live` does not touch the database, so a database outage makes the
+  service unready rather than getting it restarted in a loop; `/health/ready` does.
+- **Logging**: one line per request — method, path, status, duration and caller — written
+  from middleware rather than an interceptor, because interceptors run after guards and would
+  never see the 401s and 403s an audit trail most needs.
+- **Shutdown** closes the connection pool once in-flight requests finish.
 
 ## 11. Persistence
 
@@ -495,7 +546,7 @@ ceiling of about 9.2 × 10¹⁸ minor units is far beyond any realistic program.
 | Domain | Pure Vitest. No Nest, no DB, no mocks. Invariants, rounding, and repayment sequences. |
 | Application | Handlers against in-memory fakes implementing the ports. |
 | Integration | Real Postgres: repositories, constraints, the lock, and the lock-timeout path. |
-| E2E | Supertest through the real HTTP stack, including auth. |
+| E2E | The whole app over HTTP with Supertest: auth attacks (expired, wrong audience, `alg: none`), scopes and program grants, every status in §10.3, and a real held lock surfacing as `503 CAPACITY_BUSY`. |
 
 One integration test earns its keep above all others: N parallel reservations against a
 nearly exhausted program, asserting that the limit is never breached, that exactly the right
