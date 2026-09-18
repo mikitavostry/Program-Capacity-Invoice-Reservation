@@ -5,7 +5,7 @@ capacity when approved for early payment, and release it back when repaid. Capac
 also arrives from an external treasury system over Kafka, including periodic bulk
 reconciliation messages. Programs and invoices may be denominated in different currencies.
 
-> Status: domain model and persistence are implemented and tested; the application layer,
+> Status: domain model, persistence and application layer are implemented and tested; the
 > HTTP API and authentication are next.
 
 ## Stack

@@ -59,9 +59,12 @@ src/
 │     │  ├─ record-repayment/     command + handler
 │     │  ├─ open-program/         command + handler
 │     │  ├─ get-program-capacity/ query + handler
-│     │  └─ list-reservations/    query + handler
+│     │  ├─ list-reservations/    query + handler, keyset cursor
+│     │  ├─ ports/                CapacityReadModel (the unlocked query side)
+│     │  ├─ views.ts              what handlers return — never aggregates
+│     │  └─ errors.ts             not-found and idempotency conflicts
 │     ├─ infrastructure/
-│     │  ├─ persistence/prisma/   repositories, mappers, ledger writer, transaction runner
+│     │  ├─ persistence/prisma/   repositories, mappers, ledger, read model, transaction runner
 │     │  └─ fx/                   static rate provider (stand-in for a real FX service)
 │     ├─ presentation/http/       controller, request/response DTOs, error filter
 │     └─ capacity.module.ts
@@ -219,11 +222,17 @@ the ledger inside the transaction, and publishes them to the `EventBus` after it
 That keeps the domain framework-free while still getting a publisher for free — which is
 precisely the hook Kafka attaches to later.
 
+Handlers return **views** — plain data built from the aggregates — so aggregates never leave
+the layer that is allowed to change them. Queries go through a `CapacityReadModel` port that
+reads without locks; nothing it returns is ever used to decide whether capacity is available.
+
 Reserve, end to end:
 
 1. Controller validates the request DTO; the guard has already resolved the caller's scope.
-2. If the invoice currency differs from the program's, `ExchangeRateProvider.rateFor(...)`
-   fetches the rate — **before** any transaction is opened (§6).
+2. The program's currency is read through the read model — safe without a lock, because a
+   currency never changes — and if the invoice's differs, `ExchangeRateProvider.rateFor(...)`
+   fetches the rate. Both happen **before** any transaction is opened (§6); a unit test
+   asserts the rate provider is never called while a transaction is open.
 3. Handler opens a transaction and locks the program row (`findByIdForUpdate`).
 4. If the invoice already has an active reservation on this program, the existing one is
    returned unchanged (§7).
@@ -286,16 +295,38 @@ CREATE UNIQUE INDEX ON reservations (program_id, invoice_id) WHERE status = 'ACT
 ```
 
 Under the program lock, the handler's "does this invoice already have an active
-reservation?" check is race-free, and a replay returns the existing reservation instead of
-creating a second hold. The index is the backstop for any path that skips the check. Once a
-reservation is fully released the invoice can be reserved again.
+reservation?" check is race-free. A replay **for the same amount** returns the existing
+reservation (`created: false`) instead of creating a second hold; a request for a
+**different** amount is refused with `INVOICE_ALREADY_RESERVED`, since it cannot be a retry
+and guessing which amount was meant would be wrong half the time. The index is the backstop
+for any path that skips the check. Once a reservation is fully repaid the invoice can be
+reserved again.
+
+**Known limitation.** A reservation replay is recognised only while the reservation it
+repeats is still active. A retry delivered *after* the invoice has been fully repaid would
+create a new reservation. Closing that gap needs a client-supplied idempotency key on
+reservations, as repayments already have; it is deferred because the invoicing context is
+not expected to re-approve an invoice it has just seen repaid, and the gap is documented
+rather than assumed away.
+
+**Programs** are opened under a caller-supplied id — the treasury feed will refer to programs
+by their upstream ids — so opening is idempotent the same way: the same id with the same
+limit returns the existing program, a different limit is refused with
+`PROGRAM_ALREADY_EXISTS`. The handler inserts first and looks only on conflict, so the unique
+key settles concurrent opens rather than a check that could race.
 
 **Repayments.** Full release was naturally idempotent — a second attempt found nothing
 left to release — but a partial one is not: "repay €40" replayed would free capacity twice.
 Every repayment therefore carries a `RepaymentId` from the caller, recorded on its ledger
 row under a unique constraint. A replay with the same id returns the original outcome
-without applying anything; a replay that reuses the id with a *different* amount is refused,
-because the caller has made a mistake that should not be silently papered over.
+(`replayed: true`) without applying anything; a replay that reuses the id with a *different*
+amount or for a *different* invoice is refused with `REPAYMENT_ID_REUSED`, because the caller
+has made a mistake that should not be silently papered over. A replay of "repay whatever is
+outstanding" (no amount) matches whatever that turned out to be.
+
+Both guarantees are tested under concurrent delivery against real Postgres: five copies of
+one reservation arriving at once hold capacity once, and five copies of one repayment release
+it once.
 
 ## 8. The capacity ledger
 
@@ -400,10 +431,13 @@ taxonomy:
 | --- | --- |
 | `INSUFFICIENT_CAPACITY` | 409 |
 | `PROGRAM_NOT_ACTIVE` | 409 |
+| `PROGRAM_ALREADY_EXISTS` | 409 |
+| `INVOICE_ALREADY_RESERVED` | 409 |
 | `RESERVATION_ALREADY_RELEASED` | 409 |
 | `REPAYMENT_ID_REUSED` | 409 |
 | `PROGRAM_NOT_FOUND` / `RESERVATION_NOT_FOUND` | 404 |
 | `INVALID_AMOUNT` | 422 |
+| `INVALID_QUERY` | 400 |
 | `REPAYMENT_EXCEEDS_OUTSTANDING` | 422 |
 | `REPAYMENT_CURRENCY_MISMATCH` | 422 |
 | `CURRENCY_NOT_CONVERTIBLE` / `UNSUPPORTED_CURRENCY` | 422 |

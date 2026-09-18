@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isLockNotAvailable } from './postgres-errors.js';
+import { isLockNotAvailable, isUniqueViolation } from './postgres-errors.js';
 
 /**
  * The error Prisma 7.10 with `@prisma/adapter-pg` actually raises when `lock_timeout` expires,
@@ -57,5 +57,24 @@ describe('isLockNotAvailable', () => {
     circular['cause'] = circular;
 
     expect(isLockNotAvailable(circular)).toBe(false);
+  });
+});
+
+describe('isUniqueViolation', () => {
+  it('recognises Prisma’s own code for a duplicate key', () => {
+    expect(isUniqueViolation({ name: 'PrismaClientKnownRequestError', code: 'P2002' })).toBe(true);
+  });
+
+  it('recognises the Postgres SQLSTATE carried inside a driver adapter error', () => {
+    expect(
+      isUniqueViolation({
+        code: 'P2010',
+        meta: { driverAdapterError: { cause: { originalCode: '23505' } } },
+      }),
+    ).toBe(true);
+  });
+
+  it('does not mistake a lock timeout for a duplicate', () => {
+    expect(isUniqueViolation(observedLockTimeout)).toBe(false);
   });
 });

@@ -9,6 +9,7 @@ export interface ProgramRepository {
    */
   lockById(id: ProgramId): Promise<Program | null>;
 
+  /** Rejects with `ProgramAlreadyExistsError` if the id is taken. */
   insert(program: Program): Promise<void>;
 
   /**

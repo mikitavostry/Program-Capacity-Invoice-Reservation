@@ -20,6 +20,14 @@ export class InsufficientCapacityError extends DomainError {
   }
 }
 
+export class ProgramAlreadyExistsError extends DomainError {
+  readonly code = 'PROGRAM_ALREADY_EXISTS';
+
+  constructor(programId: ProgramId) {
+    super(`Program ${programId.value} already exists.`);
+  }
+}
+
 export class ProgramNotActiveError extends DomainError {
   readonly code = 'PROGRAM_NOT_ACTIVE';
 

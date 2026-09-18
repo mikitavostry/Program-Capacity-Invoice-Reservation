@@ -1,5 +1,9 @@
 /** SQLSTATE raised when `lock_timeout` expires before a row lock is granted. */
 const LOCK_NOT_AVAILABLE = '55P03';
+/** SQLSTATE for a unique constraint violation. */
+const UNIQUE_VIOLATION = '23505';
+/** Prisma's own code for a unique constraint violation raised through its query API. */
+const PRISMA_UNIQUE_VIOLATION = 'P2002';
 
 const CODE_KEYS = ['code', 'originalCode'] as const;
 const NESTED_KEYS = ['cause', 'meta', 'driverAdapterError'] as const;
@@ -18,6 +22,14 @@ const MAX_DEPTH = 6;
  */
 export function isLockNotAvailable(error: unknown): boolean {
   return carriesCode(error, LOCK_NOT_AVAILABLE, new Set(), 0);
+}
+
+/** Whether an error was a unique constraint refusing a duplicate, by either route it arrives. */
+export function isUniqueViolation(error: unknown): boolean {
+  return (
+    carriesCode(error, PRISMA_UNIQUE_VIOLATION, new Set(), 0) ||
+    carriesCode(error, UNIQUE_VIOLATION, new Set(), 0)
+  );
 }
 
 function carriesCode(value: unknown, code: string, seen: Set<object>, depth: number): boolean {

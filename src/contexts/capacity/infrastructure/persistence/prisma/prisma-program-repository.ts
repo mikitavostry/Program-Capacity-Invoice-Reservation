@@ -1,9 +1,11 @@
 import type { Prisma } from '../../../../../generated/prisma/client.js';
 import { InvariantViolationError } from '../../../../../shared/domain/invariant-violation-error.js';
+import { ProgramAlreadyExistsError } from '../../../domain/errors.js';
 import type { ProgramId } from '../../../domain/ids.js';
 import type { ProgramRepository } from '../../../domain/ports/program-repository.js';
 import type { Program } from '../../../domain/program.js';
 import { fromProgram, toProgram, type ProgramRow } from './mappers.js';
+import { isUniqueViolation } from './postgres-errors.js';
 
 export class PrismaProgramRepository implements ProgramRepository {
   constructor(private readonly tx: Prisma.TransactionClient) {}
@@ -27,7 +29,12 @@ export class PrismaProgramRepository implements ProgramRepository {
   }
 
   async insert(program: Program): Promise<void> {
-    await this.tx.program.create({ data: fromProgram(program) });
+    try {
+      await this.tx.program.create({ data: fromProgram(program) });
+    } catch (error) {
+      if (isUniqueViolation(error)) throw new ProgramAlreadyExistsError(program.id);
+      throw error;
+    }
   }
 
   async save(program: Program): Promise<void> {
