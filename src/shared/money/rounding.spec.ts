@@ -24,6 +24,21 @@ describe('divideWithRounding', () => {
     });
   });
 
+  describe('FLOOR', () => {
+    it.each([
+      [7n, 2n, 3n], // 3.5 -> 3
+      [2n, 3n, 0n], // 0.667 -> 0
+      [999n, 1000n, 0n], // just short of a whole unit still rounds down
+    ])('rounds %s/%s down to %s', (numerator, divisor, expected) => {
+      expect(divideWithRounding(numerator, divisor, 'FLOOR')).toBe(expected);
+    });
+
+    it('rounds towards negative infinity for negatives, not towards zero', () => {
+      expect(divideWithRounding(-7n, 2n, 'FLOOR')).toBe(-4n); // -3.5 -> -4
+      expect(divideWithRounding(-1n, 3n, 'FLOOR')).toBe(-1n); // -0.333 -> -1
+    });
+  });
+
   describe('HALF_UP', () => {
     it.each([
       [5n, 2n, 3n], // 2.5 -> 3, tie away from zero

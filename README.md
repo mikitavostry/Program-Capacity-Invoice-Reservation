@@ -41,6 +41,7 @@ The API listens on `http://localhost:3000` (override with `PORT`).
 | `npm run test:cov` | Unit tests with coverage       |
 | `npm run test:e2e` | End-to-end tests               |
 | `npm run lint`     | Lint `src/` and `test/`        |
+| `npm run typecheck`| Type-check everything, tests included |
 | `npm run format`   | Format with Prettier           |
 
 ## Architecture
@@ -57,15 +58,22 @@ the trade-offs behind each choice. In brief:
 | Persistence | PostgreSQL + Prisma, explicit domain-to-row mappers |
 | Application layer | `@nestjs/cqrs` command and query buses |
 | Aggregates | `Program` and `Reservation` as separate roots, written in one transaction |
-| Concurrency | Optimistic version column with bounded retry |
-| Currency | Convert on reservation, snapshot the rate, replay it on release |
-| Rounding | Round up — the reserved amount is a risk exposure hold, not a settlement figure |
+| Concurrency | Pessimistic `SELECT … FOR UPDATE` on the program row, no I/O inside the lock |
+| Repayments | Partial or full, idempotent by the caller's `RepaymentId` |
+| Audit | Append-only capacity ledger alongside the counter — not event sourcing |
+| Currency | Convert on reservation, snapshot the rate, replay it on every repayment |
+| Rounding | `CEILING` to reserve, `FLOOR` on the running total to release, exact final settlement |
+| Safety net | `CHECK` constraints mirroring the domain invariants |
 | Auth | JWT bearer with a default-deny global guard |
 
 Kafka ingestion from the treasury system is deferred; the seam it attaches to is described
-in §12 of the architecture document.
+in §13 of the architecture document.
 
 ## Notes and trade-offs
+
+- **Run `npm run typecheck` as well as the tests.** `nest build` excludes spec files and
+  Vitest strips types without checking them, so a type error in a test would otherwise pass
+  unnoticed.
 
 - **Use `npm ci`, not a from-scratch `npm install`.** npm 10.9.3 (bundled with Node 22.19)
   hits an `arborist` bug — `Cannot read properties of null (reading 'edgesOut')` — while
