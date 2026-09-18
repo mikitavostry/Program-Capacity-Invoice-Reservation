@@ -437,6 +437,19 @@ CHECK (released_minor >= 0 AND released_minor <= reserved_minor)
 CHECK (amount_minor >= 0)                        -- ledger
 ```
 
+Two further guards are structural rather than `CHECK`s:
+
+- **Composite foreign keys** on `(program_id, currency)` pin a reservation's held currency,
+  and every ledger row's currency, to its program's. A reservation cannot hold euros against
+  a dollar program even if code tried to write one.
+- **A trigger rejects any `UPDATE` or `DELETE`** on `capacity_movements`, so the ledger is
+  append-only in the database, not merely by convention. (It does not stop `TRUNCATE`; in
+  production the application's role should not be granted that.)
+
+The concurrency integration test proves the lock is load-bearing: with `FOR UPDATE` removed,
+only 3 of 30 concurrent reservations succeed — the rest are lost updates, which the `version`
+assertion catches and reports rather than letting the program oversubscribe.
+
 Amounts are stored as `BIGINT` minor units next to a currency code — a single `NUMERIC(p, 2)`
 column cannot represent currencies that subdivide into zero or three places. `BIGINT`'s
 ceiling of about 9.2 × 10¹⁸ minor units is far beyond any realistic program.

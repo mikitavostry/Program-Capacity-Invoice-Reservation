@@ -1,0 +1,119 @@
+// Schema for the Program Capacity context.
+//
+// Amounts are stored as BIGINT minor units beside a currency code: a single NUMERIC(p, 2)
+// column cannot hold currencies that subdivide into zero or three places. Invariants that
+// the schema language cannot express — CHECK constraints and the ledger's append-only
+// trigger — are added by hand in the migrations. See docs/architecture.md §11.
+
+generator client {
+  provider               = "prisma-client"
+  output                 = "../src/generated/prisma"
+  runtime                = "nodejs"
+  moduleFormat           = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+  previewFeatures        = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ProgramStatus {
+  ACTIVE
+  SUSPENDED
+
+  @@map("program_status")
+}
+
+enum ReservationStatus {
+  ACTIVE
+  RELEASED
+
+  @@map("reservation_status")
+}
+
+enum MovementType {
+  RESERVE
+  RELEASE
+
+  @@map("movement_type")
+}
+
+/// A financing program's capacity. `reserved_minor` is a counter denormalised from the
+/// reservations and the ledger, and the only figure the capacity check reads.
+model Program {
+  id               String        @id
+  currency         String        @db.Char(3)
+  creditLimitMinor BigInt        @map("credit_limit_minor")
+  reservedMinor    BigInt        @map("reserved_minor")
+  status           ProgramStatus
+  /// Incremented on every write. Under the row lock a mismatch is impossible, so one is a bug.
+  version          Int
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  reservations Reservation[]
+  movements    CapacityMovement[]
+
+  /// Target of the composite foreign keys that pin a reservation's and a movement's currency
+  /// to their program's.
+  @@unique([id, currency])
+  @@map("programs")
+}
+
+/// One hold against a program, and the repayments that wind it down.
+model Reservation {
+  id               String            @id
+  programId        String            @map("program_id")
+  invoiceId        String            @map("invoice_id")
+  invoiceCurrency  String            @map("invoice_currency") @db.Char(3)
+  invoiceMinor     BigInt            @map("invoice_minor")
+  /// Always the program's currency; the composite foreign key enforces it.
+  reservedCurrency String            @map("reserved_currency") @db.Char(3)
+  reservedMinor    BigInt            @map("reserved_minor")
+  /// Invoice currency → program currency, snapshotted at reservation. Null when they match.
+  exchangeRate     Decimal?          @map("exchange_rate") @db.Decimal(24, 8)
+  rateAsOf         DateTime?         @map("rate_as_of") @db.Timestamptz(3)
+  repaidMinor      BigInt            @map("repaid_minor")
+  releasedMinor    BigInt            @map("released_minor")
+  status           ReservationStatus
+  reservedAt       DateTime          @map("reserved_at") @db.Timestamptz(3)
+  releasedAt       DateTime?         @map("released_at") @db.Timestamptz(3)
+
+  program   Program            @relation(fields: [programId, reservedCurrency], references: [id, currency])
+  movements CapacityMovement[]
+
+  /// An invoice may hold at most one live reservation against a program.
+  @@unique([programId, invoiceId], map: "reservations_one_active_per_invoice", where: raw("status = 'ACTIVE'"))
+  @@index([programId, reservedAt])
+  @@map("reservations")
+}
+
+/// The append-only capacity ledger: one immutable row per change to a program's counter.
+model CapacityMovement {
+  id                  String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  programId           String       @map("program_id")
+  reservationId       String       @map("reservation_id")
+  type                MovementType
+  /// The program's currency; `amount_minor` and `available_after_minor` are in it.
+  currency            String       @db.Char(3)
+  /// Capacity held (RESERVE) or freed (RELEASE). A RELEASE may free nothing.
+  amountMinor         BigInt       @map("amount_minor")
+  availableAfterMinor BigInt       @map("available_after_minor")
+  /// RELEASE only: the caller's repayment reference and what it repaid, in invoice currency.
+  repaymentId         String?      @map("repayment_id")
+  repaidCurrency      String?      @map("repaid_currency") @db.Char(3)
+  repaidMinor         BigInt?      @map("repaid_minor")
+  occurredAt          DateTime     @map("occurred_at") @db.Timestamptz(3)
+  recordedAt          DateTime     @default(now()) @map("recorded_at") @db.Timestamptz(3)
+
+  program     Program     @relation(fields: [programId, currency], references: [id, currency])
+  reservation Reservation @relation(fields: [reservationId], references: [id])
+
+  /// Repayment idempotency: a repayment id is applied at most once per program.
+  @@unique([programId, repaymentId])
+  @@unique([reservationId], map: "capacity_movements_one_reserve_per_reservation", where: raw("type = 'RESERVE'"))
+  @@index([programId, occurredAt])
+  @@map("capacity_movements")
+}
