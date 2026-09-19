@@ -1,3 +1,4 @@
+import { ApplyTreasuryUpdateHandler } from '../../src/contexts/capacity/application/apply-treasury-update/apply-treasury-update.handler.js';
 import { GetProgramCapacityHandler } from '../../src/contexts/capacity/application/get-program-capacity/get-program-capacity.handler.js';
 import { ListReservationsHandler } from '../../src/contexts/capacity/application/list-reservations/list-reservations.handler.js';
 import { OpenProgramHandler } from '../../src/contexts/capacity/application/open-program/open-program.handler.js';
@@ -53,6 +54,7 @@ export function capacityFixture() {
     openProgram: new OpenProgramHandler(store.transactions, store.readModel, clock, bus),
     reserve: new ReserveCapacityHandler(store.transactions, store.readModel, rates, clock, bus),
     repay: new RecordRepaymentHandler(store.transactions, clock, bus),
+    applyTreasury: new ApplyTreasuryUpdateHandler(store.transactions, bus),
     getCapacity: new GetProgramCapacityHandler(store.readModel),
     listReservations: new ListReservationsHandler(store.readModel),
   };

@@ -11,8 +11,15 @@ import {
   RepaymentExceedsOutstandingError,
   ReservationAlreadyReleasedError,
   ReservationProgramMismatchError,
+  StaleTreasuryUpdateError,
 } from './errors.js';
-import { CapacityReleased, CapacityReserved, ProgramOpened } from './events.js';
+import {
+  CapacityDiscrepancyDetected,
+  CapacityReleased,
+  CapacityReserved,
+  CreditLimitChanged,
+  ProgramOpened,
+} from './events.js';
 import { InvoiceId, ProgramId, RepaymentId, ReservationId } from './ids.js';
 import { Program, type ProgramSnapshot } from './program.js';
 import { Reservation } from './reservation.js';
@@ -71,6 +78,7 @@ function snapshot(overrides: Partial<ProgramSnapshot> = {}): ProgramSnapshot {
     reservedAmount: usd('0.00'),
     status: 'ACTIVE',
     version: 3,
+    treasurySequence: 0,
     ...overrides,
   };
 }
@@ -487,7 +495,169 @@ describe('Program', () => {
     });
   });
 
+  describe('treasury updates', () => {
+    const TREASURY_AT = new Date('2026-09-20T08:00:00.000Z');
+
+    const applyTreasury = (
+      program: Program,
+      creditLimit: Money,
+      sequence: number,
+      reportedReservedAmount: Money | null = null,
+    ): void =>
+      program.applyTreasuryState({
+        creditLimit,
+        reportedReservedAmount,
+        sequence,
+        at: TREASURY_AT,
+      });
+
+    it('adopts a new credit limit and records what changed', () => {
+      const program = openProgram('1000.00');
+
+      applyTreasury(program, usd('2500.00'), 7);
+      const [event] = program.pullDomainEvents() as CreditLimitChanged[];
+
+      expect(program.creditLimit.equals(usd('2500.00'))).toBe(true);
+      expect(program.treasurySequence).toBe(7);
+      expect(event).toBeInstanceOf(CreditLimitChanged);
+      expect(event.previousLimit.equals(usd('1000.00'))).toBe(true);
+      expect(event.creditLimit.equals(usd('2500.00'))).toBe(true);
+      expect(event.overLimit).toBe(false);
+    });
+
+    it('records nothing when the limit is unchanged, but still moves the sequence on', () => {
+      const program = openProgram('1000.00');
+
+      applyTreasury(program, usd('1000.00'), 7);
+
+      expect(program.treasurySequence).toBe(7);
+      expect(program.domainEvents).toHaveLength(0);
+    });
+
+    it.each([
+      ['older than', 3],
+      ['the same as', 7],
+    ])('refuses a message %s the sequence already applied', (_, sequence) => {
+      const program = openProgram('1000.00');
+      applyTreasury(program, usd('2000.00'), 7);
+      program.pullDomainEvents();
+
+      expect(() => applyTreasury(program, usd('9000.00'), sequence)).toThrow(
+        StaleTreasuryUpdateError,
+      );
+      expect(program.creditLimit.equals(usd('2000.00'))).toBe(true);
+    });
+
+    it('refuses a limit in another currency, or one that is not positive', () => {
+      const program = openProgram('1000.00');
+
+      expect(() => applyTreasury(program, eur('2000.00'), 7)).toThrow(InvariantViolationError);
+      expect(() => applyTreasury(program, usd('0.00'), 7)).toThrow(InvalidAmountError);
+    });
+
+    describe('when treasury cuts the limit below what is already reserved', () => {
+      function overLimitProgram(): Program {
+        const program = openProgram('1000.00');
+        reserve(program, usd('800.00'));
+        program.pullDomainEvents();
+        applyTreasury(program, usd('500.00'), 7);
+        return program;
+      }
+
+      it('keeps the existing holds and goes over limit rather than refusing treasury', () => {
+        const program = overLimitProgram();
+
+        expect(program.isOverLimit).toBe(true);
+        expect(program.creditLimit.equals(usd('500.00'))).toBe(true);
+        expect(program.reservedAmount.equals(usd('800.00'))).toBe(true);
+        expect(program.availableCapacity.equals(usd('-300.00'))).toBe(true);
+      });
+
+      it('says so in the event it records', () => {
+        const [event] = overLimitProgram().pullDomainEvents() as CreditLimitChanged[];
+
+        expect(event.overLimit).toBe(true);
+      });
+
+      it('takes no new reservation, however small', () => {
+        const program = overLimitProgram();
+
+        expect(() => reserve(program, usd('0.01'))).toThrow(InsufficientCapacityError);
+      });
+
+      it('still accepts repayments, and lends again once back under the limit', () => {
+        const program = openProgram('1000.00');
+        const reservation = reserve(program, usd('800.00'));
+        applyTreasury(program, usd('500.00'), 7);
+
+        repay(program, reservation, usd('400.00'));
+
+        expect(program.isOverLimit).toBe(false);
+        expect(program.availableCapacity.equals(usd('100.00'))).toBe(true);
+        expect(() => reserve(program, usd('100.00'))).not.toThrow();
+      });
+    });
+
+    describe('reconciliation', () => {
+      it('reports a difference between treasury’s view of what is reserved and ours', () => {
+        const program = openProgram('1000.00');
+        reserve(program, usd('250.00'));
+        program.pullDomainEvents();
+
+        applyTreasury(program, usd('1000.00'), 7, usd('300.00'));
+        const [event] = program.pullDomainEvents() as CapacityDiscrepancyDetected[];
+
+        expect(event).toBeInstanceOf(CapacityDiscrepancyDetected);
+        expect(event.reportedAmount.equals(usd('300.00'))).toBe(true);
+        expect(event.reservedAmount.equals(usd('250.00'))).toBe(true);
+        expect(event.difference.equals(usd('50.00'))).toBe(true);
+      });
+
+      it('does not adopt the reported figure: ours stays the one backed by the ledger', () => {
+        const program = openProgram('1000.00');
+        reserve(program, usd('250.00'));
+
+        applyTreasury(program, usd('1000.00'), 7, usd('300.00'));
+
+        expect(program.reservedAmount.equals(usd('250.00'))).toBe(true);
+      });
+
+      it('says nothing when the two agree', () => {
+        const program = openProgram('1000.00');
+        reserve(program, usd('250.00'));
+        program.pullDomainEvents();
+
+        applyTreasury(program, usd('1000.00'), 7, usd('250.00'));
+
+        expect(program.domainEvents).toHaveLength(0);
+      });
+
+      it('refuses a reported amount in another currency', () => {
+        const program = openProgram('1000.00');
+
+        expect(() => applyTreasury(program, usd('1000.00'), 7, eur('250.00'))).toThrow(
+          InvariantViolationError,
+        );
+      });
+    });
+  });
+
   describe('rehydrating', () => {
+    it('restores a program that is over its limit, which treasury can cause', () => {
+      const program = Program.rehydrate(
+        snapshot({ creditLimit: usd('500.00'), reservedAmount: usd('800.00') }),
+      );
+
+      expect(program.isOverLimit).toBe(true);
+      expect(program.availableCapacity.equals(usd('-300.00'))).toBe(true);
+    });
+
+    it('refuses a negative treasury sequence', () => {
+      expect(() => Program.rehydrate(snapshot({ treasurySequence: -1 }))).toThrow(
+        InvariantViolationError,
+      );
+    });
+
     it('restores state without recording any events', () => {
       const program = Program.rehydrate(snapshot({ reservedAmount: usd('400.00'), version: 7 }));
 
@@ -503,7 +673,6 @@ describe('Program', () => {
     });
 
     it.each<[string, Partial<ProgramSnapshot>]>([
-      ['more reserved than the limit', { reservedAmount: usd('1000.01') }],
       ['a negative reservation', { reservedAmount: usd('-1.00') }],
       ['a negative limit', { creditLimit: usd('-1.00') }],
       ['a reservation in another currency', { reservedAmount: eur('0.00') }],

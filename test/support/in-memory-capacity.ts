@@ -11,8 +11,10 @@ import {
 } from '../../src/contexts/capacity/application/views.js';
 import { ProgramAlreadyExistsError } from '../../src/contexts/capacity/domain/errors.js';
 import {
+  CapacityDiscrepancyDetected,
   CapacityReleased,
   CapacityReserved,
+  CreditLimitChanged,
   ProgramOpened,
 } from '../../src/contexts/capacity/domain/events.js';
 import type {
@@ -31,6 +33,11 @@ import type {
 } from '../../src/contexts/capacity/domain/ports/capacity-transaction-runner.js';
 import type { ProgramRepository } from '../../src/contexts/capacity/domain/ports/program-repository.js';
 import type { ReservationRepository } from '../../src/contexts/capacity/domain/ports/reservation-repository.js';
+import {
+  TreasuryEventAlreadyRecordedError,
+  type TreasuryEventLog,
+  type TreasuryEventRecord,
+} from '../../src/contexts/capacity/domain/ports/treasury-event-log.js';
 import { Program, type ProgramSnapshot } from '../../src/contexts/capacity/domain/program.js';
 import {
   Reservation,
@@ -54,6 +61,7 @@ export class InMemoryCapacity {
   readonly programs = new Map<string, ProgramSnapshot>();
   readonly reservations = new Map<string, ReservationSnapshot>();
   readonly movements: Movement[] = [];
+  readonly treasuryEvents: TreasuryEventRecord[] = [];
 
   /** How many transactions are open right now — lets a test prove nothing slow runs in one. */
   openTransactions = 0;
@@ -93,6 +101,7 @@ class InMemoryTransactionRunner implements CapacityTransactionRunner {
       programs: new Map(store.programs),
       reservations: new Map(store.reservations),
       movements: [...store.movements],
+      treasuryEvents: [...store.treasuryEvents],
     };
 
     store.openTransactions += 1;
@@ -101,6 +110,7 @@ class InMemoryTransactionRunner implements CapacityTransactionRunner {
         programs: new InMemoryProgramRepository(store),
         reservations: new InMemoryReservationRepository(store),
         ledger: new InMemoryLedger(store),
+        treasuryEvents: new InMemoryTreasuryEventLog(store),
       });
       store.commits += 1;
       return result;
@@ -108,6 +118,7 @@ class InMemoryTransactionRunner implements CapacityTransactionRunner {
       replace(store.programs, before.programs);
       replace(store.reservations, before.reservations);
       store.movements.splice(0, store.movements.length, ...before.movements);
+      store.treasuryEvents.splice(0, store.treasuryEvents.length, ...before.treasuryEvents);
       throw error;
     } finally {
       store.openTransactions -= 1;
@@ -181,7 +192,13 @@ class InMemoryLedger implements CapacityLedger {
 
   async record(events: readonly DomainEvent[]): Promise<void> {
     for (const event of events) {
-      if (event instanceof ProgramOpened) continue;
+      if (
+        event instanceof ProgramOpened ||
+        event instanceof CreditLimitChanged ||
+        event instanceof CapacityDiscrepancyDetected
+      ) {
+        continue;
+      }
       if (!(event instanceof CapacityReserved) && !(event instanceof CapacityReleased)) {
         throw new InvariantViolationError(`The ledger cannot record ${event.eventName}.`);
       }
@@ -217,6 +234,17 @@ class InMemoryLedger implements CapacityLedger {
         m.aggregateId === programId &&
         m.repaymentId.equals(repaymentId),
     );
+  }
+}
+
+class InMemoryTreasuryEventLog implements TreasuryEventLog {
+  constructor(private readonly store: InMemoryCapacity) {}
+
+  async record(entry: TreasuryEventRecord): Promise<void> {
+    if (this.store.treasuryEvents.some((seen) => seen.eventId === entry.eventId)) {
+      throw new TreasuryEventAlreadyRecordedError(entry.eventId);
+    }
+    this.store.treasuryEvents.push(entry);
   }
 }
 

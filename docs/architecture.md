@@ -14,8 +14,9 @@ Two contexts are upstream and not owned here:
 - **Invoicing** — we hold an `InvoiceId`, the invoice's amount and currency, and references
   to its repayments. We never model an Invoice. Whether it is approved, disputed or overdue
   is not our concern; we are told to reserve against it and told when it is repaid.
-- **Treasury** — the external system that feeds capacity changes and bulk reconciliation
-  over Kafka. Deferred for now (see §13), but the seam it will attach to is fixed.
+- **Treasury** — the system of record for how much credit a program has. It publishes
+  capacity changes and bulk reconciliation over Kafka; we consume them (§13). It owns the
+  credit limit; we own what is reserved against it.
 
 ## 2. The dependency rule
 
@@ -50,26 +51,29 @@ src/
 │     │  ├─ program.ts            aggregate root — owns the capacity invariant
 │     │  ├─ reservation.ts        aggregate root — one hold and its repayments
 │     │  ├─ ids.ts                ProgramId, ReservationId, InvoiceId, RepaymentId
-│     │  ├─ events.ts             ProgramOpened, CapacityReserved, CapacityReleased
+│     │  ├─ events.ts             ProgramOpened, CapacityReserved, CapacityReleased,
+│     │  │                        CreditLimitChanged, CapacityDiscrepancyDetected
 │     │  ├─ errors.ts             InsufficientCapacity, RepaymentExceedsOutstanding, ...
-│     │  └─ ports/                ProgramRepository, ReservationRepository,
-│     │                           ExchangeRateProvider, TransactionRunner
+│     │  └─ ports/                ProgramRepository, ReservationRepository, CapacityLedger,
+│     │                           TreasuryEventLog, ExchangeRateProvider, TransactionRunner
 │     ├─ application/
 │     │  ├─ reserve-capacity/     command + handler
 │     │  ├─ record-repayment/     command + handler
 │     │  ├─ open-program/         command + handler
 │     │  ├─ get-program-capacity/ query + handler
 │     │  ├─ list-reservations/    query + handler, keyset cursor
+│     │  ├─ apply-treasury-update/ command + handler (the feed's only way in)
 │     │  ├─ ports/                CapacityReadModel (the unlocked query side)
 │     │  ├─ views.ts              what handlers return — never aggregates
 │     │  └─ errors.ts             not-found and idempotency conflicts
 │     ├─ infrastructure/
 │     │  ├─ persistence/prisma/   repositories, mappers, ledger, read model, transaction runner
+│     │  ├─ messaging/            treasury ACL, consumer, dead letters, feed lifecycle
 │     │  └─ fx/                   static rate provider (stand-in for a real FX service)
 │     ├─ presentation/http/       controllers, zod schemas, presenters, error statuses
 │     └─ capacity.module.ts
 ├─ iam/                    token verifier, authentication + authorization guards, @Public
-├─ platform/               config, Prisma client, problem-details filter, logging, health
+├─ platform/               config, Prisma + Kafka clients, problem-details filter, health
 ├─ app.module.ts
 └─ main.ts
 ```
@@ -84,24 +88,31 @@ feature folders.
 
 ```ts
 class Program extends AggregateRoot<ProgramId> {
-  #creditLimit: Money;
-  #reservedAmount: Money;   // denormalised counter
+  #creditLimit: Money;      // treasury owns this
+  #reservedAmount: Money;   // denormalised counter; we own this
   #status: ProgramStatus;   // ACTIVE | SUSPENDED
+  #treasurySequence: number;
   readonly version: number;
 
   get availableCapacity(): Money;                              // creditLimit − reservedAmount
+  get isOverLimit(): boolean;
   reserveFor(request: ReserveCapacity): Reservation;
   release(reservation: Reservation, repayment: ApplyRepayment): Money;
+  applyTreasuryState(state: TreasuryState): void;
 }
 ```
 
 Invariants enforced inside the root:
 
-- `0 ≤ reservedAmount ≤ creditLimit`
+- nothing this service does takes `reservedAmount` above `creditLimit` or below zero
 - every `Money` the program holds is denominated in the program's own currency
 - a program must be `ACTIVE` to accept new reservations
 - repayments are accepted whatever the status: capacity that has been repaid must be freed,
   even on a suspended program
+- treasury state is applied only in increasing sequence order (§13.2)
+
+`reservedAmount` can exceed `creditLimit`, but only because treasury lowered the limit under
+existing holds — see §4.5.
 
 ### 4.2 Two aggregates, not one
 
@@ -202,6 +213,22 @@ Three €0.01 instalments free $0.01, $0.01, then the remaining $0.02. The total
 
 A consequence worth stating: an instalment worth less than one minor unit of the program's
 currency frees nothing at the time. It is still recorded, and later repayments catch up.
+
+### 4.5 Over limit
+
+Treasury owns the credit limit and may cut it below what a program already has reserved.
+Existing reservations are commitments; they cannot be torn up to fit a smaller limit. So the
+cut is applied and the program sits **over limit**:
+
+- `availableCapacity` goes negative;
+- every new reservation is refused, because any positive amount exceeds what is available;
+- repayments still free capacity, and the program returns to normal once reserved falls back
+  under the limit.
+
+**Trade-off.** The alternative is to refuse treasury's instruction, which would leave this
+service and the system of record disagreeing about the limit — the worse failure, and one
+nobody would notice. This is why the database constraint is `reserved >= 0` rather than
+`reserved <= limit`: the tighter rule cannot be true while treasury can move the limit.
 
 ## 5. Use cases (CQRS)
 
@@ -553,21 +580,73 @@ nearly exhausted program, asserting that the limit is never breached, that exact
 number succeed, and that no reservation which fits is rejected. It has to run against real
 Postgres, because what it tests is the concurrency control, not the code around it.
 
-## 13. Deferred: the Kafka seam
+## 13. The treasury feed
 
-Kafka is out of scope for now. When it lands it attaches at
-`contexts/capacity/infrastructure/messaging/`:
+Treasury publishes to Kafka; we consume in `contexts/capacity/infrastructure/messaging/`.
+Two kinds of message, both carrying a program's **full state** rather than a delta:
 
-- a consumer as an **inbound adapter**, plus an **anti-corruption layer** translating
-  treasury payloads into the same application commands the HTTP layer already dispatches;
-- `program.reconcile(...)` on the aggregate for bulk state replacement, recorded as
-  `ADJUSTMENT` rows in the ledger, with treasury's own sequence numbers used to order and
-  de-duplicate reconciliation messages;
-- outbound domain events via a transactional **outbox**. The ledger is written in the same
-  transaction as the state it describes, so it may serve as that outbox with a `published_at`
-  column rather than duplicating it — to be decided when there is a publisher.
+| Event type | Means | Carries |
+| --- | --- | --- |
+| `program.capacity.changed` | the credit limit moved | the new limit |
+| `program.state.reconciled` | periodic bulk reconciliation | the limit, plus treasury's view of what is reserved |
 
-The point of the seam is that adding it changes no domain or application code.
+Full state rather than deltas is what makes the feed safe to reorder or replay: the newest
+message wins and nothing has to be replayed to arrive at the right answer.
+
+### 13.1 The anti-corruption layer
+
+`treasury-message.ts` is the only file that knows treasury's wire format — their field names,
+their envelope, their event-type strings. It validates a message and translates it into a
+command in our own language, holding our own value objects. A change at their end is a change
+there and nowhere else.
+
+Amounts arrive as decimal strings and become `Money`; unknown fields are rejected rather than
+ignored, because an unexpected field more often means a contract change nobody read than a
+harmless extra.
+
+### 13.2 Ordering, duplicates and what treasury does not own
+
+- **Ordering.** Every message carries a per-program `sequence`. Anything not strictly newer
+  than the sequence already applied is recorded and ignored — Kafka reorders, and that is
+  routine rather than exceptional.
+- **Duplicates.** Each message's `eventId` is written to `treasury_events` under a unique
+  constraint in the same transaction as its effect, so at-least-once delivery applies once.
+  The table doubles as the audit trail: every message, applied or not, with the reason and
+  the payload exactly as it arrived.
+- **Reconciliation does not overwrite what we hold reserved.** Treasury's figure is compared
+  with ours, and a difference raises `CapacityDiscrepancyDetected` for someone to investigate.
+  Adopting their number would break the chain that explains ours — per-invoice reservations
+  and an immutable ledger — and silence the drift detector in §4.2. Money being wrong and
+  visible beats money being wrong and hidden.
+
+### 13.3 Failure handling
+
+Each failure is one of two kinds, and telling them apart is the whole job of the consumer:
+
+| Kind | Examples | What happens |
+| --- | --- | --- |
+| **Permanent** — the same bytes will always fail | not JSON, not the agreed schema, unknown program | Published to the dead-letter topic with the reason and its original topic, partition and offset; the feed moves on rather than blocking the partition behind a message that can never pass. |
+| **Temporary** — the message is fine, the moment is not | a locked program, the database down | Rethrown: the offset is not committed and the message comes back. Dead-lettering these would throw away real capacity changes. |
+
+Anything unrecognised is treated as temporary. Parking a message wrongly loses a capacity
+change; retrying one wrongly is visible and recoverable.
+
+Dead letters keep the original bytes untouched, because whoever investigates needs what
+treasury actually sent, not this service's reading of it.
+
+### 13.4 Operating it
+
+The feed is off unless `KAFKA_ENABLED=true`, so the HTTP service runs with no broker at all.
+Topics are expected to exist before the service starts; when one does not, the consumer's
+metadata refresh is set to 30 seconds so it picks the topic up shortly after it appears
+rather than after librdkafka's five-minute default.
+
+### 13.5 Still deferred: publishing our own events
+
+Domain events are published in-process after commit. Nothing outside the service consumes
+them yet, so the transactional **outbox** that would be needed to publish them reliably is
+not built. The ledger is already written in the same transaction as the state it describes,
+so it can serve as that outbox with a `published_at` column when there is a consumer.
 
 ## 14. Decision log
 
@@ -584,3 +663,7 @@ The point of the seam is that adding it changes no domain or application code.
 | Database constraints | `CHECK` constraints mirroring the invariants | Domain checks only |
 | Domain ↔ persistence | Explicit mappers | Prisma types as domain models |
 | Auth | JWT bearer, default-deny guard | API keys, OAuth2 client credentials |
+| Treasury messages | Full state per message, ordered by sequence | Deltas replayed in order |
+| A limit cut below what is reserved | Accept it; the program goes over limit | Refuse treasury, or cancel reservations to fit |
+| Reconciliation mismatch | Report it; keep our own figure | Adopt treasury's reserved amount |
+| Unrecognised consumer failures | Retry, on the assumption they may clear | Dead-letter them |

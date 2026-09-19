@@ -18,5 +18,26 @@ services:
       timeout: 3s
       retries: 30
 
+  # Kafka API-compatible broker: one binary, starts in seconds, no ZooKeeper or KRaft setup.
+  redpanda:
+    image: redpandadata/redpanda:v25.2.5
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:${KAFKA_PORT:-19092}
+    ports:
+      - '${KAFKA_PORT:-19092}:19092'
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ['CMD-SHELL', 'rpk cluster health | grep -q "Healthy:.*true"']
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
 volumes:
   postgres-data:
+  redpanda-data:

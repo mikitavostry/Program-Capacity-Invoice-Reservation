@@ -19,7 +19,13 @@ import { Reservation } from '../../../domain/reservation.js';
 
 export type ProgramRow = Pick<
   ProgramRecord,
-  'id' | 'currency' | 'creditLimitMinor' | 'reservedMinor' | 'status' | 'version'
+  | 'id'
+  | 'currency'
+  | 'creditLimitMinor'
+  | 'reservedMinor'
+  | 'status'
+  | 'version'
+  | 'treasurySequence'
 >;
 
 export function toProgram(row: ProgramRow): Program {
@@ -31,7 +37,23 @@ export function toProgram(row: ProgramRow): Program {
     reservedAmount: Money.fromMinorUnits(row.reservedMinor, currency),
     status: row.status,
     version: row.version,
+    treasurySequence: toSequence(row.id, row.treasurySequence),
   });
+}
+
+/**
+ * Sequences are BIGINT in the database and a plain number in the domain. Anything beyond
+ * exact representation is refused rather than silently rounded — at one message a second it
+ * would take almost three hundred million years to get there, so this should never fire.
+ */
+function toSequence(programId: string, sequence: bigint): number {
+  const value = Number(sequence);
+  if (!Number.isSafeInteger(value)) {
+    throw new InvariantViolationError(
+      `Program ${programId} has treasury sequence ${sequence}, which is too large to represent exactly.`,
+    );
+  }
+  return value;
 }
 
 export function fromProgram(program: Program): Prisma.ProgramUncheckedCreateInput {
@@ -42,6 +64,7 @@ export function fromProgram(program: Program): Prisma.ProgramUncheckedCreateInpu
     reservedMinor: program.reservedAmount.minorUnits,
     status: program.status,
     version: program.version,
+    treasurySequence: BigInt(program.treasurySequence),
   };
 }
 

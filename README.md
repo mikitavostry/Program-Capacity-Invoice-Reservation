@@ -5,8 +5,7 @@ capacity when approved for early payment, and release it back when repaid. Capac
 also arrives from an external treasury system over Kafka, including periodic bulk
 reconciliation messages. Programs and invoices may be denominated in different currencies.
 
-> Status: complete and runnable, apart from the Kafka treasury feed, which is deferred by
-> agreement; the seam it attaches to is described in the architecture document.
+> Status: complete and runnable — HTTP API, authentication, and the Kafka treasury feed.
 
 ## Stack
 
@@ -16,6 +15,7 @@ reconciliation messages. Programs and invoices may be denominated in different c
 | Framework  | NestJS 12 (ESM, `"type": "module"`)     |
 | Language   | TypeScript 6, `strict` mode             |
 | Database   | PostgreSQL 17 via Prisma 7.10 (pinned)  |
+| Messaging  | Kafka (Redpanda locally), Confluent client |
 | Tests      | Vitest: unit, integration, e2e          |
 | Lint       | oxlint                                  |
 | Formatting | Prettier                                |
@@ -25,12 +25,12 @@ Because the project is ESM, relative imports must carry a `.js` extension
 
 ## Running locally
 
-Requires Docker, for Postgres.
+Requires Docker, for Postgres and Kafka.
 
 ```bash
 cp .env.example .env     # local settings; matches docker-compose.yml
 npm ci                   # also generates the Prisma client
-npm run db:up            # Postgres on localhost:5433, waits until healthy
+npm run db:up            # Postgres on 5433 and Kafka on 19092, waits until healthy
 npm run db:migrate       # apply migrations
 npm run start:dev        # http://localhost:3000
 ```
@@ -68,11 +68,41 @@ JSON numbers, which cannot carry money exactly. Errors come back as RFC 9457
 `application/problem+json` with a stable `code`; the full list is in the
 [architecture document](docs/architecture.md#10-http-api).
 
+### The treasury feed
+
+Treasury owns each program's credit limit and publishes changes over Kafka. The feed is off
+by default so the API runs without a broker; turn it on and send it something:
+
+```bash
+KAFKA_ENABLED=true npm run start:dev
+
+npm run treasury -- --program program-1 --limit 2500000.00 --sequence 1   # capacity change
+npm run treasury -- --program program-1 --limit 2500000.00 --sequence 2                     --reserved 125000.00                                  # bulk reconciliation
+npm run treasury -- --program program-1 --malformed                       # goes to dead letters
+```
+
+Two behaviours worth knowing, both deliberate and explained in
+[§13](docs/architecture.md#13-the-treasury-feed):
+
+- **Treasury can cut a limit below what is already reserved.** Existing holds stand, the
+  program goes *over limit* (available capacity is negative), and new reservations are refused
+  until repayments bring it back under.
+- **Reconciliation never overwrites what we hold reserved.** A difference between treasury's
+  figure and ours is reported as a discrepancy, because ours is the one backed by per-invoice
+  reservations and an immutable ledger.
+
+Messages that can never succeed — not JSON, not the schema, an unknown program — are parked
+in the dead-letter topic with the reason, rather than blocking the feed:
+
+```bash
+docker compose exec redpanda rpk topic consume treasury.program-capacity.dead-letter --num 1
+```
+
 ### Tests
 
 ```bash
 npm test                 # unit — pure, no infrastructure
-npm run test:int         # integration — real Postgres; needs `npm run db:up`
+npm run test:int         # integration — real Postgres and Kafka; needs `npm run db:up`
 npm run test:e2e         # end to end — the whole app over HTTP; needs `npm run db:up`
 ```
 
@@ -93,6 +123,7 @@ mistake.
 | `npm run test:cov` | Unit tests with coverage       |
 | `npm run test:e2e` | End-to-end tests over HTTP (real Postgres) |
 | `npm run token`    | Mint a local bearer token      |
+| `npm run treasury` | Publish a treasury message to the local feed |
 | `npm run lint`     | Lint `src/` and `test/`        |
 | `npm run typecheck`| Type-check everything, tests included |
 | `npm run format`   | Format with Prettier           |
@@ -122,6 +153,8 @@ the trade-offs behind each choice. In brief:
 | Rounding | `CEILING` to reserve, `FLOOR` on the running total to release, exact final settlement |
 | Safety net | `CHECK` constraints mirroring the domain invariants |
 | Auth | JWT bearer with a default-deny global guard |
+| Treasury feed | Full state per message, ordered by sequence, idempotent by event id |
+| Reconciliation | Reports a mismatch; never overwrites our reserved amount |
 
 Kafka ingestion from the treasury system is deferred; the seam it attaches to is described
 in §13 of the architecture document.

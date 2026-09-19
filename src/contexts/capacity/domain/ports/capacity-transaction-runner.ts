@@ -2,12 +2,14 @@ import { DomainError } from '../../../../shared/domain/domain-error.js';
 import type { CapacityLedger } from './capacity-ledger.js';
 import type { ProgramRepository } from './program-repository.js';
 import type { ReservationRepository } from './reservation-repository.js';
+import type { TreasuryEventLog } from './treasury-event-log.js';
 
 /** Repositories bound to one transaction: everything written through them commits together. */
 export interface CapacityUnitOfWork {
   readonly programs: ProgramRepository;
   readonly reservations: ReservationRepository;
   readonly ledger: CapacityLedger;
+  readonly treasuryEvents: TreasuryEventLog;
 }
 
 export interface CapacityTransactionRunner {

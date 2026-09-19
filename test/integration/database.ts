@@ -41,7 +41,10 @@ export function createTestPrisma(): PrismaClient {
 export async function truncateAll(prisma: PrismaClient): Promise<void> {
   // TRUNCATE is not a row-level UPDATE or DELETE, so the ledger's append-only trigger does not
   // fire. That is fine for tests; in production the application role should not hold TRUNCATE.
-  await prisma.$executeRawUnsafe('TRUNCATE capacity_movements, reservations, programs');
+  // Every table that references `programs` has to be named, or Postgres refuses the truncate.
+  await prisma.$executeRawUnsafe(
+    'TRUNCATE capacity_movements, treasury_events, reservations, programs',
+  );
 }
 
 export interface CapacityTotals {

@@ -50,16 +50,43 @@ model Program {
   status           ProgramStatus
   /// Incremented on every write. Under the row lock a mismatch is impossible, so one is a bug.
   version          Int
+  /// Highest treasury sequence applied to this program; anything not newer is ignored.
+  treasurySequence BigInt        @default(0) @map("treasury_sequence")
   createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt        DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  reservations Reservation[]
-  movements    CapacityMovement[]
+  reservations   Reservation[]
+  movements      CapacityMovement[]
+  treasuryEvents TreasuryEvent[]
 
   /// Target of the composite foreign keys that pin a reservation's and a movement's currency
   /// to their program's.
   @@unique([id, currency])
   @@map("programs")
+}
+
+/// Every treasury message this service has accepted, applied or not: the deduplication key
+/// and the audit trail for capacity the service did not decide itself.
+model TreasuryEvent {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  programId  String   @map("program_id")
+  /// The producer's id for this message; the same message delivered twice is recorded once.
+  eventId    String   @unique @map("event_id")
+  kind       String
+  sequence   BigInt
+  /// Whether it changed anything: a message older than what we hold is recorded and ignored.
+  applied    Boolean
+  /// Why it was not applied, when it was not.
+  reason     String?
+  /// The message as received, so a decision can be re-examined against what actually arrived.
+  payload    Json
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(3)
+  recordedAt DateTime @default(now()) @map("recorded_at") @db.Timestamptz(3)
+
+  program Program @relation(fields: [programId], references: [id])
+
+  @@index([programId, sequence])
+  @@map("treasury_events")
 }
 
 /// One hold against a program, and the repayments that wind it down.

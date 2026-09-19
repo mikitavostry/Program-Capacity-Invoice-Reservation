@@ -9,8 +9,15 @@ import {
   ProgramNotActiveError,
   ReservationAlreadyReleasedError,
   ReservationProgramMismatchError,
+  StaleTreasuryUpdateError,
 } from './errors.js';
-import { CapacityReleased, CapacityReserved, ProgramOpened } from './events.js';
+import {
+  CapacityDiscrepancyDetected,
+  CapacityReleased,
+  CapacityReserved,
+  CreditLimitChanged,
+  ProgramOpened,
+} from './events.js';
 import type { InvoiceId, ProgramId, RepaymentId, ReservationId } from './ids.js';
 import { Reservation } from './reservation.js';
 
@@ -24,6 +31,22 @@ export interface ProgramSnapshot {
   readonly status: ProgramStatus;
   /** Optimistic concurrency token; the repository compares and increments it on save. */
   readonly version: number;
+  /** Highest treasury sequence applied; anything not newer is ignored (§13). */
+  readonly treasurySequence: number;
+}
+
+/** A program's state as the treasury system reports it. */
+export interface TreasuryState {
+  /** Treasury owns the limit, and may set it below what is already reserved. */
+  readonly creditLimit: Money;
+  /**
+   * Treasury's view of what is reserved, when the message carries one. Compared against ours
+   * and reported if it differs; never written over ours.
+   */
+  readonly reportedReservedAmount: Money | null;
+  /** Per-program, strictly increasing at the source. */
+  readonly sequence: number;
+  readonly at: Date;
 }
 
 export interface ReserveCapacity {
@@ -43,8 +66,12 @@ export interface ApplyRepayment {
 }
 
 /**
- * A financing program's credit capacity — the aggregate that owns the invariant
- * `0 ≤ reserved ≤ credit limit`.
+ * A financing program's credit capacity — the aggregate that owns the rule that nothing may
+ * be reserved beyond the credit limit.
+ *
+ * Reserved never goes below zero, and never rises above the limit through anything this
+ * service does. It can sit *above* the limit only because treasury cut the limit under
+ * existing holds (§4.5); the program is then over limit and takes no new reservations.
  *
  * `reservedAmount` is a counter, deliberately denormalised from the active reservations so
  * the invariant can be checked without loading them. Every change to it goes through
@@ -57,6 +84,7 @@ export class Program extends AggregateRoot<ProgramId> {
   #creditLimit: Money;
   #reservedAmount: Money;
   #status: ProgramStatus;
+  #treasurySequence: number;
 
   private constructor(state: ProgramSnapshot) {
     super(state.id);
@@ -64,6 +92,7 @@ export class Program extends AggregateRoot<ProgramId> {
     this.#reservedAmount = state.reservedAmount;
     this.#status = state.status;
     this.version = state.version;
+    this.#treasurySequence = state.treasurySequence;
   }
 
   static open(params: { id: ProgramId; creditLimit: Money; openedAt: Date }): Program {
@@ -79,6 +108,7 @@ export class Program extends AggregateRoot<ProgramId> {
       reservedAmount: Money.zero(params.creditLimit.currency),
       status: 'ACTIVE',
       version: 0,
+      treasurySequence: 0,
     });
 
     program.raise(new ProgramOpened(params.id, params.creditLimit, params.openedAt));
@@ -110,6 +140,19 @@ export class Program extends AggregateRoot<ProgramId> {
 
   get status(): ProgramStatus {
     return this.#status;
+  }
+
+  get treasurySequence(): number {
+    return this.#treasurySequence;
+  }
+
+  /**
+   * Whether the program holds more than its current limit allows — only reachable when
+   * treasury cuts a limit below what is already reserved. Available capacity is then
+   * negative and every new reservation is refused until repayments bring it back under.
+   */
+  get isOverLimit(): boolean {
+    return this.#reservedAmount.isGreaterThan(this.#creditLimit);
   }
 
   /**
@@ -210,6 +253,49 @@ export class Program extends AggregateRoot<ProgramId> {
     return released;
   }
 
+  /**
+   * Applies the state treasury reports, which owns the credit limit.
+   *
+   * Rejects anything not newer than the sequence already applied: Kafka redelivers and can
+   * reorder, so recognising that is routine rather than exceptional.
+   */
+  applyTreasuryState(state: TreasuryState): void {
+    if (state.sequence <= this.#treasurySequence) {
+      throw new StaleTreasuryUpdateError(this.id, this.#treasurySequence, state.sequence);
+    }
+
+    if (!state.creditLimit.currency.equals(this.currency)) {
+      throw new InvariantViolationError(
+        `Treasury reports a ${state.creditLimit.currency.code} limit for program ${this.id.value}, which is in ${this.currency.code}.`,
+      );
+    }
+
+    if (!state.creditLimit.isPositive) {
+      throw new InvalidAmountError(
+        `A program's credit limit must be positive, received ${state.creditLimit}.`,
+      );
+    }
+
+    const previousLimit = this.#creditLimit;
+    this.#creditLimit = state.creditLimit;
+    this.#treasurySequence = state.sequence;
+
+    if (!previousLimit.equals(state.creditLimit)) {
+      this.raise(
+        new CreditLimitChanged({
+          programId: this.id,
+          previousLimit,
+          creditLimit: state.creditLimit,
+          reservedAmount: this.#reservedAmount,
+          treasurySequence: state.sequence,
+          occurredAt: state.at,
+        }),
+      );
+    }
+
+    this.reportAnyDiscrepancy(state);
+  }
+
   toSnapshot(): ProgramSnapshot {
     return {
       id: this.id,
@@ -217,7 +303,36 @@ export class Program extends AggregateRoot<ProgramId> {
       reservedAmount: this.#reservedAmount,
       status: this.#status,
       version: this.version,
+      treasurySequence: this.#treasurySequence,
     };
+  }
+
+  /**
+   * Reports, rather than repairs, a difference between treasury's view of what is reserved
+   * and ours. Ours is explained by reservations and the ledger; theirs is a number we cannot
+   * account for, and adopting it would break both the audit trail and the drift check.
+   */
+  private reportAnyDiscrepancy(state: TreasuryState): void {
+    const reported = state.reportedReservedAmount;
+    if (reported === null) return;
+
+    if (!reported.currency.equals(this.currency)) {
+      throw new InvariantViolationError(
+        `Treasury reports ${reported.currency.code} reserved for program ${this.id.value}, which is in ${this.currency.code}.`,
+      );
+    }
+
+    if (reported.equals(this.#reservedAmount)) return;
+
+    this.raise(
+      new CapacityDiscrepancyDetected({
+        programId: this.id,
+        reportedAmount: reported,
+        reservedAmount: this.#reservedAmount,
+        treasurySequence: state.sequence,
+        occurredAt: state.at,
+      }),
+    );
   }
 
   private toProgramCurrency(amount: Money, rate: ExchangeRate | null): Money {
@@ -258,9 +373,12 @@ function assertConsistent(state: ProgramSnapshot): void {
     throw new InvariantViolationError(`${subject} cannot hold a negative limit or reservation.`);
   }
 
-  if (state.reservedAmount.isGreaterThan(state.creditLimit)) {
+  if (!Number.isSafeInteger(state.treasurySequence) || state.treasurySequence < 0) {
     throw new InvariantViolationError(
-      `${subject} has ${state.reservedAmount} reserved against a limit of ${state.creditLimit}.`,
+      `${subject} has an invalid treasury sequence ${state.treasurySequence}.`,
     );
   }
+
+  // Deliberately no `reserved <= limit` check: a treasury limit cut below what is already
+  // reserved leaves the program over limit, and existing holds stand (§4.5).
 }

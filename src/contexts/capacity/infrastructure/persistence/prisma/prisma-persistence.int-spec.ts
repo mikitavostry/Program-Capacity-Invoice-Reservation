@@ -268,12 +268,22 @@ describe('Prisma persistence', () => {
   });
 
   describe('database constraints, as a last line of defence', () => {
-    it('refuses to reserve beyond the credit limit even when the domain is bypassed', async () => {
+    it('refuses a negative reserved amount even when the domain is bypassed', async () => {
       const id = await openProgram(usd('1000.00'));
 
       await expect(
-        prisma.$executeRaw`UPDATE programs SET reserved_minor = 100001 WHERE id = ${id.value}`,
-      ).rejects.toThrow(/programs_reserved_within_limit/);
+        prisma.$executeRaw`UPDATE programs SET reserved_minor = -1 WHERE id = ${id.value}`,
+      ).rejects.toThrow(/programs_reserved_non_negative/);
+    });
+
+    it('allows reserved to exceed the limit, which is how a treasury limit cut lands', async () => {
+      const id = await openProgram(usd('1000.00'));
+
+      // Deliberately permitted: existing holds stand when treasury lowers the limit under
+      // them, and the program simply takes no new reservations (docs/architecture.md §4.5).
+      await expect(
+        prisma.$executeRaw`UPDATE programs SET credit_limit_minor = 50000 WHERE id = ${id.value}`,
+      ).resolves.toBe(1);
     });
 
     it('refuses a second active reservation for the same invoice', async () => {

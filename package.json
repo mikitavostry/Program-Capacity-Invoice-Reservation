@@ -27,9 +27,11 @@
     "test:int": "vitest run --config ./vitest.config.int.ts",
     "test:watch": "vitest",
     "token": "node --disable-warning=ExperimentalWarning scripts/issue-dev-token.ts",
+    "treasury": "node --disable-warning=ExperimentalWarning scripts/publish-treasury-message.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@confluentinc/kafka-javascript": "^1.10.1",
     "@nestjs/common": "^12.0.1",
     "@nestjs/core": "^12.0.1",
     "@nestjs/cqrs": "^12.0.0",

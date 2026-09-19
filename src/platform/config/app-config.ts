@@ -25,6 +25,16 @@ export interface AppConfig {
     readonly asOf: Date;
     readonly rates: Readonly<Record<string, string>>;
   };
+  readonly kafka: {
+    /** Off by default: the service runs, and serves HTTP, without a broker. */
+    readonly enabled: boolean;
+    readonly brokers: readonly string[];
+    readonly clientId: string;
+    readonly groupId: string;
+    readonly treasuryTopic: string;
+    /** Where messages that can never succeed are parked, rather than blocking the feed. */
+    readonly deadLetterTopic: string;
+  };
 }
 
 export const APP_CONFIG = Symbol('AppConfig');
@@ -71,8 +81,23 @@ const envSchema = z
     JWT_CLOCK_TOLERANCE_SECONDS: integer(30, 0, 300),
 
     FX_RATES: z.string().optional(),
+
+    KAFKA_ENABLED: z.enum(['true', 'false']).default('false'),
+    KAFKA_BROKERS: z.string().default(''),
+    KAFKA_CLIENT_ID: z.string().min(1).default('invoice-reservation'),
+    KAFKA_GROUP_ID: z.string().min(1).default('invoice-reservation-capacity'),
+    KAFKA_TREASURY_TOPIC: z.string().min(1).default('treasury.program-capacity'),
+    KAFKA_DEAD_LETTER_TOPIC: z.string().min(1).default('treasury.program-capacity.dead-letter'),
   })
   .superRefine((env, ctx) => {
+    if (env.KAFKA_ENABLED === 'true' && brokerList(env.KAFKA_BROKERS).length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['KAFKA_BROKERS'],
+        message: 'is required when KAFKA_ENABLED is true',
+      });
+    }
+
     if (env.NODE_ENV !== 'production') return;
 
     if (env.JWT_SECRET === EXAMPLE_JWT_SECRET) {
@@ -143,7 +168,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       clockToleranceSeconds: values.JWT_CLOCK_TOLERANCE_SECONDS,
     },
     fx: parseFxTable(values.FX_RATES),
+    kafka: {
+      enabled: values.KAFKA_ENABLED === 'true',
+      brokers: brokerList(values.KAFKA_BROKERS),
+      clientId: values.KAFKA_CLIENT_ID,
+      groupId: values.KAFKA_GROUP_ID,
+      treasuryTopic: values.KAFKA_TREASURY_TOPIC,
+      deadLetterTopic: values.KAFKA_DEAD_LETTER_TOPIC,
+    },
   };
+}
+
+function brokerList(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((broker) => broker.trim())
+    .filter((broker) => broker.length > 0);
 }
 
 function parseFxTable(raw: string | undefined): AppConfig['fx'] {

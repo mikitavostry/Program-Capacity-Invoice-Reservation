@@ -8,6 +8,7 @@ import { isLockNotAvailable } from './postgres-errors.js';
 import { PrismaCapacityLedger } from './prisma-capacity-ledger.js';
 import { PrismaProgramRepository } from './prisma-program-repository.js';
 import { PrismaReservationRepository } from './prisma-reservation-repository.js';
+import { PrismaTreasuryEventLog } from './prisma-treasury-event-log.js';
 
 export interface TransactionSettings {
   /** How long to wait for a program's row lock before giving up with `CapacityBusyError`. */
@@ -56,6 +57,7 @@ export class PrismaCapacityTransactionRunner implements CapacityTransactionRunne
             programs: new PrismaProgramRepository(tx),
             reservations: new PrismaReservationRepository(tx),
             ledger: new PrismaCapacityLedger(tx),
+            treasuryEvents: new PrismaTreasuryEventLog(tx),
           });
         },
         {

@@ -3,7 +3,13 @@ import type { DomainEvent } from '../../../../../shared/domain/domain-event.js';
 import { InvariantViolationError } from '../../../../../shared/domain/invariant-violation-error.js';
 import { Currency } from '../../../../../shared/money/currency.js';
 import { Money } from '../../../../../shared/money/money.js';
-import { CapacityReleased, CapacityReserved, ProgramOpened } from '../../../domain/events.js';
+import {
+  CapacityDiscrepancyDetected,
+  CapacityReleased,
+  CapacityReserved,
+  CreditLimitChanged,
+  ProgramOpened,
+} from '../../../domain/events.js';
 import { ReservationId, type ProgramId, type RepaymentId } from '../../../domain/ids.js';
 import type { CapacityLedger, RecordedRepayment } from '../../../domain/ports/capacity-ledger.js';
 
@@ -85,8 +91,16 @@ function toMovements(event: DomainEvent): MovementInput[] {
     ];
   }
 
-  // Opening a program sets its limit; it moves no reserved capacity.
-  if (event instanceof ProgramOpened) return [];
+  // These change a program without moving reserved capacity: opening one sets its limit,
+  // treasury changes it later, and a discrepancy is an observation. The treasury events table
+  // audits the last two; the ledger stays exactly the movements of the counter.
+  if (
+    event instanceof ProgramOpened ||
+    event instanceof CreditLimitChanged ||
+    event instanceof CapacityDiscrepancyDetected
+  ) {
+    return [];
+  }
 
   throw new InvariantViolationError(
     `The capacity ledger does not know how to record a ${event.eventName} event.`,

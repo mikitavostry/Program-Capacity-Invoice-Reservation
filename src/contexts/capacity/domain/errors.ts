@@ -28,6 +28,26 @@ export class ProgramAlreadyExistsError extends DomainError {
   }
 }
 
+/**
+ * A treasury message no newer than the state already applied.
+ *
+ * Kafka redelivers and can reorder, so this is expected traffic rather than a fault: the
+ * message is recorded and ignored.
+ */
+export class StaleTreasuryUpdateError extends DomainError {
+  readonly code = 'TREASURY_UPDATE_STALE';
+  readonly applied: number;
+  readonly received: number;
+
+  constructor(programId: ProgramId, applied: number, received: number) {
+    super(
+      `Program ${programId.value} has already applied treasury sequence ${applied}; ${received} is not newer.`,
+    );
+    this.applied = applied;
+    this.received = received;
+  }
+}
+
 export class ProgramNotActiveError extends DomainError {
   readonly code = 'PROGRAM_NOT_ACTIVE';
 

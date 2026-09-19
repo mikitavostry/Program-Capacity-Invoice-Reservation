@@ -20,7 +20,8 @@ export class PrismaProgramRepository implements ProgramRepository {
              credit_limit_minor AS "creditLimitMinor",
              reserved_minor     AS "reservedMinor",
              status::text       AS status,
-             version
+             version,
+             treasury_sequence  AS "treasurySequence"
         FROM programs
        WHERE id = ${id.value}
          FOR UPDATE`;
@@ -44,6 +45,7 @@ export class PrismaProgramRepository implements ProgramRepository {
         creditLimitMinor: program.creditLimit.minorUnits,
         reservedMinor: program.reservedAmount.minorUnits,
         status: program.status,
+        treasurySequence: BigInt(program.treasurySequence),
         version: { increment: 1 },
       },
     });

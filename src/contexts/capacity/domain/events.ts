@@ -87,3 +87,72 @@ export class CapacityReleased implements DomainEvent {
     this.occurredAt = new Date(params.occurredAt);
   }
 }
+
+/**
+ * Treasury changed a program's credit limit.
+ *
+ * `overLimit` says the new limit is below what is already reserved: existing holds stand and
+ * no new capacity can be taken until repayments bring the program back under (§4.5).
+ */
+export class CreditLimitChanged implements DomainEvent {
+  readonly eventName = 'CreditLimitChanged';
+  readonly aggregateId: string;
+  readonly occurredAt: Date;
+  readonly previousLimit: Money;
+  readonly creditLimit: Money;
+  readonly reservedAmount: Money;
+  readonly overLimit: boolean;
+  readonly treasurySequence: number;
+
+  constructor(params: {
+    programId: ProgramId;
+    previousLimit: Money;
+    creditLimit: Money;
+    reservedAmount: Money;
+    treasurySequence: number;
+    occurredAt: Date;
+  }) {
+    this.aggregateId = params.programId.value;
+    this.previousLimit = params.previousLimit;
+    this.creditLimit = params.creditLimit;
+    this.reservedAmount = params.reservedAmount;
+    this.overLimit = params.reservedAmount.isGreaterThan(params.creditLimit);
+    this.treasurySequence = params.treasurySequence;
+    this.occurredAt = new Date(params.occurredAt);
+  }
+}
+
+/**
+ * Treasury's view of how much a program has reserved does not match ours.
+ *
+ * Raised, not repaired. Our figure is backed by per-invoice reservations and an immutable
+ * ledger; overwriting it with a number we cannot explain would destroy that chain and the
+ * drift detector with it. The discrepancy is surfaced for someone to investigate.
+ */
+export class CapacityDiscrepancyDetected implements DomainEvent {
+  readonly eventName = 'CapacityDiscrepancyDetected';
+  readonly aggregateId: string;
+  readonly occurredAt: Date;
+  /** What treasury believes is reserved. */
+  readonly reportedAmount: Money;
+  /** What this service holds, and continues to hold. */
+  readonly reservedAmount: Money;
+  /** Reported minus ours: positive when treasury thinks more is held than we do. */
+  readonly difference: Money;
+  readonly treasurySequence: number;
+
+  constructor(params: {
+    programId: ProgramId;
+    reportedAmount: Money;
+    reservedAmount: Money;
+    treasurySequence: number;
+    occurredAt: Date;
+  }) {
+    this.aggregateId = params.programId.value;
+    this.reportedAmount = params.reportedAmount;
+    this.reservedAmount = params.reservedAmount;
+    this.difference = params.reportedAmount.minus(params.reservedAmount);
+    this.treasurySequence = params.treasurySequence;
+    this.occurredAt = new Date(params.occurredAt);
+  }
+}
