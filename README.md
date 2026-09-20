@@ -76,7 +76,8 @@ installed on the machine. To change it, set `POSTGRES_PORT` and both URLs in `.e
 Every endpoint except `/health/*` needs a bearer token. Mint one for local use:
 
 ```bash
-TOKEN=$(docker compose exec -T api npm run token --silent | tr -d '')   # Docker stack
+TOKEN=$(docker compose exec -T api npm run token --silent | tr -d '
+')   # Docker stack
 TOKEN=$(npm run token --silent)                                          # running it yourself
 ```
 
@@ -102,6 +103,27 @@ Amounts are always `{"amount": "<decimal string>", "currency": "<ISO 4217>"}` â€
 JSON numbers, which cannot carry money exactly. Errors come back as RFC 9457
 `application/problem+json` with a stable `code`; the full list is in the
 [architecture document](docs/architecture.md#10-http-api).
+
+### Postman collection
+
+[`docs/postman/invoice-reservation.postman_collection.json`](docs/postman/invoice-reservation.postman_collection.json)
+covers the whole API â€” 30 requests, each asserting what it expects, so **Run collection** in
+Postman exercises the service end to end and reports pass/fail.
+
+Import the file and press Run; nothing else is needed. The collection mints its own bearer
+tokens from the `jwtSecret` variable, which matches the secret the Docker stack runs with, so
+there is no token to copy and paste. Point `baseUrl` at another environment and set
+`jwtSecret`, `jwtIssuer` and `jwtAudience` to match if you want to test one.
+
+Without installing Postman:
+
+```bash
+npm run test:api         # runs the same collection headlessly with Newman
+```
+
+It covers the happy paths and the refusals side by side: idempotent opens and reservations,
+FX conversion, partial and full repayments, cursor paging, insufficient capacity, validation
+failures, and 401/403 for a missing, tampered, under-scoped or wrong-program token.
 
 ### The treasury feed
 
@@ -157,6 +179,7 @@ mistake.
 | `npm run test:int` | Integration tests (real Postgres) |
 | `npm run test:cov` | Unit tests with coverage       |
 | `npm run test:e2e` | End-to-end tests over HTTP (real Postgres) |
+| `npm run test:api` | Run the Postman collection against a running service |
 | `npm run token`    | Mint a local bearer token      |
 | `npm run treasury` | Publish a treasury message to the local feed |
 | `npm run stack:up` | Build and start the whole stack in Docker |

@@ -24,6 +24,7 @@
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
     "test": "vitest run",
+    "test:api": "npx --yes newman@6 run docs/postman/invoice-reservation.postman_collection.json",
     "test:cov": "vitest run --coverage",
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
     "test:e2e": "vitest run --config ./vitest.config.e2e.ts",

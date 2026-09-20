@@ -1,0 +1,1514 @@
+{
+  "info": {
+    "name": "Invoice Reservation — Program Capacity",
+    "_postman_id": "6f1f9d8e-0c2a-4a5e-9f3c-1a2b3c4d5e6f",
+    "description": "Every request in this collection asserts what it expects, so **Run collection** exercises the\nwhole service and reports pass/fail.\n\n### Before you start\n\n```bash\ndocker compose --profile app up -d --build\n```\n\nNothing else is needed: the collection mints its own bearer tokens from `jwtSecret`, which\nmatches the secret the Docker stack runs with. Point `baseUrl` elsewhere and set `jwtSecret`,\n`jwtIssuer` and `jwtAudience` to match if you are testing another environment.\n\nRequests run in order and share state — the first one opens a program with a fresh id each run,\nand later ones reserve against it — so run the collection top to bottom rather than one request\nin isolation.\n\n### What it covers\n\n- opening a program, and the same request repeated (idempotency)\n- reserving capacity in the program currency and in another currency (FX conversion)\n- partial and full repayments, including replays and misuse of a repayment id\n- paging through reservations with a cursor\n- every refusal: insufficient capacity, validation, 401, 403\n\nThe Kafka treasury feed is not HTTP, so it is not in here — see the README for\n`npm run treasury`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "const secret = pm.collectionVariables.get(\"jwtSecret\");",
+          "const issuer = pm.collectionVariables.get(\"jwtIssuer\");",
+          "const audience = pm.collectionVariables.get(\"jwtAudience\");",
+          "",
+          "const b64url = (words) => CryptoJS.enc.Base64.stringify(words)",
+          "  .replace(/\\+/g, \"-\").replace(/\\//g, \"_\").replace(/=+$/, \"\");",
+          "const encode = (value) => b64url(CryptoJS.enc.Utf8.parse(JSON.stringify(value)));",
+          "",
+          "function sign(claims) {",
+          "  const now = Math.floor(Date.now() / 1000);",
+          "  const header = encode({ alg: \"HS256\", typ: \"JWT\" });",
+          "  const payload = encode({ iss: issuer, aud: audience, iat: now, exp: now + 3600, ...claims });",
+          "  const signature = b64url(CryptoJS.HmacSHA256(header + \".\" + payload, secret));",
+          "  return `${header}.${payload}.${signature}`;",
+          "}",
+          "",
+          "const everything = \"capacity:read capacity:write programs:admin\";",
+          "pm.collectionVariables.set(\"token\", sign({ sub: \"postman\", scope: everything, programs: \"*\" }));",
+          "pm.collectionVariables.set(\"readOnlyToken\", sign({ sub: \"postman-reader\", scope: \"capacity:read\", programs: \"*\" }));",
+          "pm.collectionVariables.set(\"writerToken\", sign({ sub: \"postman-writer\", scope: \"capacity:read capacity:write\", programs: \"*\" }));",
+          "pm.collectionVariables.set(\"otherProgramToken\", sign({ sub: \"postman-outsider\", scope: everything, programs: [\"some-other-program\"] }));",
+          "// Same token with the signature broken, for the request that expects it to be refused.",
+          "pm.collectionVariables.set(\"tamperedToken\", pm.collectionVariables.get(\"token\") + \"tampered\");"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000"
+    },
+    {
+      "key": "jwtSecret",
+      "value": "local-development-secret-change-me-0123456789"
+    },
+    {
+      "key": "jwtIssuer",
+      "value": "invoice-reservation-local"
+    },
+    {
+      "key": "jwtAudience",
+      "value": "invoice-reservation-api"
+    },
+    {
+      "key": "programId",
+      "value": ""
+    },
+    {
+      "key": "usdInvoiceId",
+      "value": ""
+    },
+    {
+      "key": "eurInvoiceId",
+      "value": ""
+    },
+    {
+      "key": "reservationId",
+      "value": ""
+    },
+    {
+      "key": "repaymentId",
+      "value": ""
+    },
+    {
+      "key": "cursor",
+      "value": ""
+    },
+    {
+      "key": "firstPageIds",
+      "value": ""
+    },
+    {
+      "key": "token",
+      "value": ""
+    },
+    {
+      "key": "readOnlyToken",
+      "value": ""
+    },
+    {
+      "key": "writerToken",
+      "value": ""
+    },
+    {
+      "key": "otherProgramToken",
+      "value": ""
+    },
+    {
+      "key": "tamperedToken",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health",
+      "description": "Unauthenticated probes. `live` deliberately does not touch the database.",
+      "item": [
+        {
+          "name": "Liveness",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 and status ok\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql(\"ok\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/live",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health",
+                "live"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Readiness",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — the database answers\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql(\"ok\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/ready",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health",
+                "ready"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Programs",
+      "description": "Opening a program is idempotent on the id the caller chooses.",
+      "item": [
+        {
+          "name": "Open a program",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A fresh program per run, so repeated runs do not collide.",
+                  "pm.collectionVariables.set(\"programId\", \"postman-\" + Date.now());",
+                  "pm.collectionVariables.set(\"usdInvoiceId\", \"invoice-usd-\" + Date.now());",
+                  "pm.collectionVariables.set(\"eurInvoiceId\", \"invoice-eur-\" + Date.now());",
+                  "pm.collectionVariables.set(\"repaymentId\", \"repayment-\" + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 — created, with the whole limit available\", () => {",
+                  "  pm.response.to.have.status(201);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.availableCapacity).to.eql({ amount: \"10000000.00\", currency: \"USD\" });",
+                  "  pm.expect(body.reservedAmount.amount).to.eql(\"0.00\");",
+                  "  pm.expect(body.status).to.eql(\"ACTIVE\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"programId\": \"{{programId}}\",\n  \"creditLimit\": {\n    \"amount\": \"10000000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Open it again, identically",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — recognised as a repeat, not created twice\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().programId).to.eql(pm.collectionVariables.get(\"programId\"));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"programId\": \"{{programId}}\",\n  \"creditLimit\": {\n    \"amount\": \"10000000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Open it again with a different limit",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 — the id is taken and this is not a retry\", () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"PROGRAM_ALREADY_EXISTS\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"programId\": \"{{programId}}\",\n  \"creditLimit\": {\n    \"amount\": \"5000000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get capacity",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — limit, reserved and available\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.creditLimit.amount).to.eql(\"10000000.00\");",
+                  "  pm.expect(body.availableCapacity.amount).to.eql(\"10000000.00\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "capacity"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get capacity for a program that does not exist",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404\", () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"PROGRAM_NOT_FOUND\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/no-such-program/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "no-such-program",
+                "capacity"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Reservations",
+      "description": "Reserving is idempotent per invoice while the reservation is active. An invoice in another currency is converted at the rate in force and the rate is kept on the reservation.",
+      "item": [
+        {
+          "name": "Reserve capacity (same currency)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 — held in full, no conversion\", () => {",
+                  "  pm.response.to.have.status(201);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.reservedAmount).to.eql({ amount: \"250000.00\", currency: \"USD\" });",
+                  "  pm.expect(body.exchangeRate).to.eql(null);",
+                  "  pm.expect(body.status).to.eql(\"ACTIVE\");",
+                  "  pm.collectionVariables.set(\"reservationId\", body.reservationId);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"{{usdInvoiceId}}\",\n  \"amount\": {\n    \"amount\": \"250000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Reserve the same invoice again",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — the existing reservation, nothing held twice\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().reservationId).to.eql(pm.collectionVariables.get(\"reservationId\"));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"{{usdInvoiceId}}\",\n  \"amount\": {\n    \"amount\": \"250000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Reserve the same invoice for a different amount",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 — cannot be a retry, so it is refused\", () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"INVOICE_ALREADY_RESERVED\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"{{usdInvoiceId}}\",\n  \"amount\": {\n    \"amount\": \"300000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Reserve an invoice in another currency",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 — EUR 100,000 held as USD 109,000 at 1.09\", () => {",
+                  "  pm.response.to.have.status(201);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.invoiceAmount).to.eql({ amount: \"100000.00\", currency: \"EUR\" });",
+                  "  pm.expect(body.reservedAmount).to.eql({ amount: \"109000.00\", currency: \"USD\" });",
+                  "  pm.expect(body.exchangeRate.rate).to.eql(\"1.09000000\");",
+                  "  pm.expect(body.exchangeRate.from).to.eql(\"EUR\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"{{eurInvoiceId}}\",\n  \"amount\": {\n    \"amount\": \"100000.00\",\n    \"currency\": \"EUR\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Reserve more than is available",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 — refused, and says what was asked for and what is left\", () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"INSUFFICIENT_CAPACITY\");",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.requested.amount).to.eql(\"20000000.00\");",
+                  "  pm.expect(body.available.amount).to.eql(\"9641000.00\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"invoice-too-big\",\n  \"amount\": {\n    \"amount\": \"20000000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Send a body the schema rejects",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 — every problem reported, each at its path\", () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"VALIDATION_FAILED\");",
+                  "  const paths = pm.response.json().issues.map((issue) => issue.path);",
+                  "  pm.expect(paths).to.include(\"body.invoiceId\");",
+                  "  pm.expect(paths).to.include(\"body.amount.amount\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"has spaces\",\n  \"amount\": {\n    \"amount\": 12.5,\n    \"currency\": \"USD\"\n  },\n  \"ammount\": \"1\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ]
+            },
+            "description": "Three problems at once: an id with characters that are not allowed, an amount sent as a JSON number rather than a decimal string, and a misspelt field. All three come back, each with its path."
+          }
+        },
+        {
+          "name": "List reservations (first page)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — one item and a cursor for the next page\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.items).to.have.lengthOf(1);",
+                  "  pm.expect(body.nextCursor).to.be.a(\"string\");",
+                  "  pm.collectionVariables.set(\"cursor\", body.nextCursor);",
+                  "  pm.collectionVariables.set(\"firstPageIds\", JSON.stringify(body.items.map((i) => i.reservationId)));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations?limit=1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "1"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "List reservations (next page)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — a different reservation, no overlap with the first page\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  const seen = JSON.parse(pm.collectionVariables.get(\"firstPageIds\"));",
+                  "  const ids = pm.response.json().items.map((i) => i.reservationId);",
+                  "  pm.expect(ids).to.have.lengthOf(1);",
+                  "  pm.expect(seen).to.not.include(ids[0]);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations?limit=1&cursor={{cursor}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "1"
+                },
+                {
+                  "key": "cursor",
+                  "value": "{{cursor}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "List with a cursor this service did not issue",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400\", () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"INVALID_QUERY\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations?cursor=forged",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ],
+              "query": [
+                {
+                  "key": "cursor",
+                  "value": "forged"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Repayments",
+      "description": "A repayment is a record created, not a reservation deleted. It carries the caller’s own id, which is what makes a redelivery safe.",
+      "item": [
+        {
+          "name": "Repay part of the converted invoice",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 — EUR 40,000 frees USD 43,600 at the stored rate\", () => {",
+                  "  pm.response.to.have.status(201);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.repaidAmount).to.eql({ amount: \"40000.00\", currency: \"EUR\" });",
+                  "  pm.expect(body.releasedAmount).to.eql({ amount: \"43600.00\", currency: \"USD\" });",
+                  "  pm.expect(body.reservation.status).to.eql(\"ACTIVE\");",
+                  "  pm.expect(body.reservation.outstandingAmount.amount).to.eql(\"60000.00\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repaymentId\": \"{{repaymentId}}\",\n  \"amount\": {\n    \"amount\": \"40000.00\",\n    \"currency\": \"EUR\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations/{{eurInvoiceId}}/repayments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations",
+                "{{eurInvoiceId}}",
+                "repayments"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Send the same repayment again",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — the original outcome, nothing released twice\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().releasedAmount.amount).to.eql(\"43600.00\");",
+                  "  pm.expect(pm.response.json().reservation.outstandingAmount.amount).to.eql(\"60000.00\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repaymentId\": \"{{repaymentId}}\",\n  \"amount\": {\n    \"amount\": \"40000.00\",\n    \"currency\": \"EUR\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations/{{eurInvoiceId}}/repayments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations",
+                "{{eurInvoiceId}}",
+                "repayments"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Reuse the repayment id for a different amount",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 — an id cannot mean two different repayments\", () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"REPAYMENT_ID_REUSED\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repaymentId\": \"{{repaymentId}}\",\n  \"amount\": {\n    \"amount\": \"10000.00\",\n    \"currency\": \"EUR\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations/{{eurInvoiceId}}/repayments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations",
+                "{{eurInvoiceId}}",
+                "repayments"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Repay more than is outstanding",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"422 — refused rather than capped, and says what is outstanding\", () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"REPAYMENT_EXCEEDS_OUTSTANDING\");",
+                  "  pm.expect(pm.response.json().outstanding.amount).to.eql(\"60000.00\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repaymentId\": \"repayment-overpayment\",\n  \"amount\": {\n    \"amount\": \"999999.00\",\n    \"currency\": \"EUR\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations/{{eurInvoiceId}}/repayments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations",
+                "{{eurInvoiceId}}",
+                "repayments"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Repay whatever is left",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 — the rest is freed and the reservation is released\", () => {",
+                  "  pm.response.to.have.status(201);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.repaidAmount).to.eql({ amount: \"60000.00\", currency: \"EUR\" });",
+                  "  pm.expect(body.releasedAmount).to.eql({ amount: \"65400.00\", currency: \"USD\" });",
+                  "  pm.expect(body.reservation.status).to.eql(\"RELEASED\");",
+                  "  pm.expect(body.reservation.outstandingAmount.amount).to.eql(\"0.00\");",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"the released amount equals what was held, to the cent\", () => {",
+                  "  const body = pm.response.json();",
+                  "  const total = Number(body.releasedAmount.amount) + 43600;",
+                  "  pm.expect(total).to.eql(Number(body.reservation.reservedAmount.amount));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repaymentId\": \"repayment-final-{{eurInvoiceId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations/{{eurInvoiceId}}/repayments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations",
+                "{{eurInvoiceId}}",
+                "repayments"
+              ]
+            },
+            "description": "Omitting the amount repays the outstanding balance, whatever it is now."
+          }
+        },
+        {
+          "name": "Repay an invoice with nothing outstanding",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404\", () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"RESERVATION_NOT_FOUND\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repaymentId\": \"repayment-unknown-invoice\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations/invoice-never-reserved/repayments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations",
+                "invoice-never-reserved",
+                "repayments"
+              ]
+            }
+          }
+        },
+        {
+          "name": "List released reservations",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — the repaid invoice, and only that one\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  const ids = pm.response.json().items.map((i) => i.invoiceId);",
+                  "  pm.expect(ids).to.eql([pm.collectionVariables.get(\"eurInvoiceId\")]);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations?status=RELEASED",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "RELEASED"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Capacity after the repayments",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — only the USD reservation is still held\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().reservedAmount.amount).to.eql(\"250000.00\");",
+                  "  pm.expect(pm.response.json().availableCapacity.amount).to.eql(\"9750000.00\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "capacity"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Authentication and authorization",
+      "description": "Every route needs a token; every route also states the scope it needs, and a token grants access only to the programs it names.",
+      "item": [
+        {
+          "name": "No token at all",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"401 — and says how to authenticate\", () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.headers.get(\"WWW-Authenticate\")).to.include(\"Bearer\");",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"UNAUTHENTICATED\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "capacity"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "A tampered token",
+          "request": {
+            "method": "GET",
+            "auth": {
+              "type": "noauth"
+            },
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tamperedToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "capacity"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"401 — without saying which check failed\", () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().detail).to.eql(\"The bearer token is not valid.\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Read-only token reading capacity",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — reading is what it is allowed to do\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "capacity"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{readOnlyToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Read-only token reserving capacity",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"403 — writing needs capacity:write\", () => {",
+                  "  pm.response.to.have.status(403);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"FORBIDDEN\");",
+                  "  pm.expect(pm.response.json().detail).to.include(\"capacity:write\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"invoice-denied\",\n  \"amount\": {\n    \"amount\": \"1.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{readOnlyToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Token for another program",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"403 — every scope, but not this program\", () => {",
+                  "  pm.response.to.have.status(403);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"FORBIDDEN\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "capacity"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{otherProgramToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Non-admin token opening a program",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"403 — opening a program needs programs:admin\", () => {",
+                  "  pm.response.to.have.status(403);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"FORBIDDEN\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"programId\": \"postman-should-not-exist\",\n  \"creditLimit\": {\n    \"amount\": \"1.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{writerToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
