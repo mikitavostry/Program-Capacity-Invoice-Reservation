@@ -1,0 +1,13 @@
+node_modules
+dist
+coverage
+.git
+.github
+.env
+.env.*
+!.env.example
+# Generated during the image build by `prisma generate`.
+src/generated
+docs
+docker
+*.log

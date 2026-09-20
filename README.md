@@ -25,15 +25,48 @@ Because the project is ESM, relative imports must carry a `.js` extension
 
 ## Running locally
 
-Requires Docker, for Postgres and Kafka.
+Everything — Postgres, Kafka, migrations and the service — starts with one command. Docker is
+the only prerequisite.
+
+```bash
+docker compose --profile app up -d --build
+```
+
+That brings up the database, a Kafka broker, creates the topics, applies the migrations and
+starts the API on <http://localhost:3000>, with the treasury feed switched on. Watch it with
+`docker compose --profile app logs -f api`, and stop it with
+`docker compose --profile app down` (add `-v` to discard the data too).
+
+Check it is up:
+
+```bash
+curl localhost:3000/health/ready      # {"status":"ok"}
+```
+
+Every other endpoint needs a bearer token; mint one from inside the container:
+
+```bash
+docker compose exec api npm run token
+```
+
+Then jump to [Calling the API](#calling-the-api). To publish a treasury message, run the same
+script in the container: `docker compose exec api npm run treasury -- --program program-1
+--limit 2500000.00 --sequence 1`.
+
+### Running it for development
+
+To work on the code, run only the infrastructure in Docker and the service on your machine.
+Requires Node.js 22.19 or newer.
 
 ```bash
 cp .env.example .env     # local settings; matches docker-compose.yml
 npm ci                   # also generates the Prisma client
 npm run db:up            # Postgres on 5433 and Kafka on 19092, waits until healthy
 npm run db:migrate       # apply migrations
-npm run start:dev        # http://localhost:3000
+npm run start:dev        # http://localhost:3000, restarts on change
 ```
+
+`npm run stack:up`, `stack:down` and `stack:logs` are shorthands for the Docker commands above.
 
 Postgres is published on **5433**, not 5432, so it does not collide with a Postgres already
 installed on the machine. To change it, set `POSTGRES_PORT` and both URLs in `.env` together.
@@ -43,10 +76,12 @@ installed on the machine. To change it, set `POSTGRES_PORT` and both URLs in `.e
 Every endpoint except `/health/*` needs a bearer token. Mint one for local use:
 
 ```bash
-TOKEN=$(npm run token --silent)          # every scope, every program
+TOKEN=$(docker compose exec -T api npm run token --silent | tr -d '')   # Docker stack
+TOKEN=$(npm run token --silent)                                          # running it yourself
 ```
 
-`npm run token -- --scope capacity:read --programs program-1` narrows it. Then:
+Either grants every scope on every program; `-- --scope capacity:read --programs program-1`
+narrows it. Then:
 
 ```bash
 # Open a program (admin)
@@ -70,8 +105,8 @@ JSON numbers, which cannot carry money exactly. Errors come back as RFC 9457
 
 ### The treasury feed
 
-Treasury owns each program's credit limit and publishes changes over Kafka. The feed is off
-by default so the API runs without a broker; turn it on and send it something:
+Treasury owns each program's credit limit and publishes changes over Kafka. It is already on
+in the Docker stack; running the service from your machine, it is off unless you ask for it:
 
 ```bash
 KAFKA_ENABLED=true npm run start:dev
@@ -124,6 +159,9 @@ mistake.
 | `npm run test:e2e` | End-to-end tests over HTTP (real Postgres) |
 | `npm run token`    | Mint a local bearer token      |
 | `npm run treasury` | Publish a treasury message to the local feed |
+| `npm run stack:up` | Build and start the whole stack in Docker |
+| `npm run stack:down` | Stop it |
+| `npm run stack:logs` | Follow the service's logs |
 | `npm run lint`     | Lint `src/` and `test/`        |
 | `npm run typecheck`| Type-check everything, tests included |
 | `npm run format`   | Format with Prettier           |

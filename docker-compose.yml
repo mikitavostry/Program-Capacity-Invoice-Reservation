@@ -38,6 +38,73 @@ services:
       timeout: 5s
       retries: 30
 
+  # Topics are expected to exist before the service starts, exactly as they would be
+  # provisioned in a real environment. Runs once and exits.
+  kafka-topics:
+    profiles: ['app']
+    image: redpandadata/redpanda:v25.2.5
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ['/bin/sh', '-c']
+    command: >
+      "rpk topic create treasury.program-capacity treasury.program-capacity.dead-letter
+       --brokers redpanda:9092 || true"
+    restart: 'no'
+
+  # Applies migrations before the API starts, so the schema is never half a step behind the
+  # code. Runs once and exits; the API waits for it to succeed.
+  migrate:
+    profiles: ['app']
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://capacity:capacity@postgres:5432/capacity
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    restart: 'no'
+
+  api:
+    profiles: ['app']
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      kafka-topics:
+        condition: service_completed_successfully
+    environment:
+      # Local demo values. NODE_ENV stays development so `npm run token` works inside the
+      # container; production configuration is stricter and is covered by its own tests.
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: postgresql://capacity:capacity@postgres:5432/capacity
+      JWT_SECRET: local-development-secret-change-me-0123456789
+      JWT_ISSUER: invoice-reservation-local
+      JWT_AUDIENCE: invoice-reservation-api
+      KAFKA_ENABLED: 'true'
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TREASURY_TOPIC: treasury.program-capacity
+      KAFKA_DEAD_LETTER_TOPIC: treasury.program-capacity.dead-letter
+    ports:
+      - '${PORT:-3000}:3000'
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:3000/health/ready').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
 volumes:
   postgres-data:
   redpanda-data:
