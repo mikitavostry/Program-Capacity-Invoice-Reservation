@@ -9,6 +9,8 @@ export interface AppConfig {
   readonly database: {
     readonly url: string;
     readonly poolSize: number;
+    /** How long to wait for a new connection before failing, rather than hanging on TCP. */
+    readonly connectTimeoutMs: number;
     readonly lockTimeoutMs: number;
     readonly statementTimeoutMs: number;
     readonly transactionTimeoutMs: number;
@@ -77,6 +79,7 @@ const envSchema = z
 
     DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/, error: 'must be a postgresql:// URL' }),
     DATABASE_POOL_SIZE: integer(10, 1, 200),
+    DB_CONNECT_TIMEOUT_MS: integer(3_000, 100, 60_000),
     DB_LOCK_TIMEOUT_MS: integer(3_000, 50, 60_000),
     DB_STATEMENT_TIMEOUT_MS: integer(5_000, 100, 300_000),
     DB_TRANSACTION_TIMEOUT_MS: integer(10_000, 100, 300_000),
@@ -192,6 +195,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     database: {
       url: values.DATABASE_URL,
       poolSize: values.DATABASE_POOL_SIZE,
+      connectTimeoutMs: values.DB_CONNECT_TIMEOUT_MS,
       lockTimeoutMs: values.DB_LOCK_TIMEOUT_MS,
       statementTimeoutMs: values.DB_STATEMENT_TIMEOUT_MS,
       transactionTimeoutMs: values.DB_TRANSACTION_TIMEOUT_MS,

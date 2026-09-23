@@ -25,6 +25,7 @@ describe('loadConfig', () => {
     expect(config.environment).toBe('development');
     expect(config.port).toBe(3000);
     expect(config.database.poolSize).toBe(10);
+    expect(config.database.connectTimeoutMs).toBe(3_000);
     expect(config.database.lockTimeoutMs).toBe(3000);
     expect(config.fx.rates['EUR/USD']).toBe('1.09');
   });

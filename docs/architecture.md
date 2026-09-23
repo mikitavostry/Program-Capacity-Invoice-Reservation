@@ -234,6 +234,8 @@ before touching reservations.
 | `lock_timeout` (3 s) | a waiter gives up with `503 CAPACITY_BUSY` |
 | `statement_timeout` (5 s) | caps any single statement |
 | `idle_in_transaction_session_timeout` / transaction timeout (10 s) | frees a lock held by a stalled transaction |
+| connection timeout (`DB_CONNECT_TIMEOUT_MS`, 3 s) | a request fails fast with `503 DATABASE_UNAVAILABLE` when the database is unreachable, rather than waiting minutes on TCP |
+| client-side query timeout (the transaction timeout, 10 s) | a query to a database that stopped answering mid-connection fails instead of hanging |
 
 `version` is incremented on every save and checked on write.
 
@@ -356,7 +358,7 @@ the main rules (Prisma schema plus hand-written SQL in the migrations):
 | `POST /programs/:programId/reservations` | `reservations:write` | 201 reserved · 200 identical repeat |
 | `GET /programs/:programId/reservations?status=&limit=&cursor=` | `capacity:read` | 200, cursor-paged |
 | `POST /programs/:programId/reservations/:invoiceId/repayments` | `repayments:write` | 201 applied · 200 replayed |
-| `GET /health/live`, `GET /health/ready` | none | 200 · 503 when the database is down |
+| `GET /health/live`, `GET /health/ready` | none | 200 · 503 when the database is down or does not answer within 2 s |
 
 **Authentication and authorization.** Bearer JWTs (HS256) with the algorithm pinned and issuer,
 audience and expiry checked. Two global guards: authentication on every route except those
@@ -392,7 +394,7 @@ relevant (e.g. `requested` / `available`).
 | 413 | `PAYLOAD_TOO_LARGE` |
 | 422 | `INVALID_AMOUNT`, `REPAYMENT_EXCEEDS_OUTSTANDING`, `REPAYMENT_CURRENCY_MISMATCH`, `CURRENCY_NOT_CONVERTIBLE`, `UNSUPPORTED_CURRENCY` |
 | 500 | `INTERNAL_ERROR` (includes invariant violations and unmapped codes) |
-| 503 | `CAPACITY_BUSY`, with `Retry-After` |
+| 503 | `CAPACITY_BUSY` (`Retry-After: 1`), `DATABASE_UNAVAILABLE` (`Retry-After: 5`); nothing was changed, so the request can be retried as is |
 
 Domain error codes are mapped to statuses in `presentation/http/error-statuses.ts`.
 
@@ -494,7 +496,8 @@ Local tools that play the treasury system:
   secret and the development FX table are rejected.
 - **FX rates** — a static rate table (`FX_RATES`), a stand-in for a live rate service (§4);
   built-in illustrative rates outside production, where `FX_RATES` is required.
-- **Health** — `/health/live` does not query the database; `/health/ready` does. Kafka is
+- **Health** — `/health/live` does not query the database; `/health/ready` does, and answers
+  unready within 2 s even when the database does not answer at all. Kafka is
   deliberately not part of readiness: without the broker the API still reserves and releases
   correctly (limits are briefly stale, events wait in the outbox), and failing readiness would
   take every instance out of the load balancer for an outage that does not stop them working.
@@ -583,6 +586,30 @@ What this service announces, on `KAFKA_CAPACITY_EVENTS_TOPIC` (default `capacity
   published once the relay runs.
 - **Not yet:** a clean-up of published rows (they are kept, and could be pruned after a retention
   period).
+
+### 3.12 When a dependency fails
+
+The service's rule: an outage may delay work or refuse it with a retryable status, but never
+lose, duplicate or half-apply a change. Each case below was checked against the running Docker
+stack.
+
+| Failure | HTTP API | Treasury feed | Published events | Recovery |
+| --- | --- | --- | --- | --- |
+| **Kafka down** while running | keeps working: reserve, repay and read as usual; readiness stays `200` (§3.9) | no new messages arrive, so limits are stale until it returns | wait in `outbox_events` | automatic: the client reconnects; the outbox drained within seconds of the broker's return |
+| **Database down** | `503 DATABASE_UNAVAILABLE` with `Retry-After: 5`, within the 3 s connection timeout; readiness `503` within 2 s | the message is retried with backoff (§3.8), its offset not committed | the relay retries every tick | automatic: the next request succeeds; a treasury message sent during the outage was applied seconds after |
+| **Program locked** too long | `503 CAPACITY_BUSY` with `Retry-After: 1` | retried with backoff | — | the next attempt |
+| **Dead-letter topic unreachable** | — | the message is retried with backoff rather than parked | — | automatic |
+| **Process crash** mid-request | the transaction rolls back; a retry is answered idempotently (§2.6) | the offset was not committed, so the message is redelivered and deduplicated | an unmarked batch is published again and deduplicated by `eventId` | restart |
+
+Every `503` means nothing was changed, so the caller can repeat the request as it is.
+
+**Starting while Kafka is down.** The service refuses to start: it cannot tell a broker that is
+briefly away from a wrong address or missing topics, and a deploy that cannot reach its feed
+should fail loudly rather than serve with a feed that never arrives. The orchestrator restarts it
+with backoff until the broker answers (the Compose stack does the same with
+`restart: unless-stopped`; it was ready about 9 s after the broker returned). A running instance
+is unaffected by a Kafka outage, as above. Starting while the database is down succeeds, and the
+instance reports unready until the database answers.
 
 ## 4. Before production
 

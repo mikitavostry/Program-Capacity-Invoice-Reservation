@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { DomainError } from '../../shared/domain/domain-error.js';
+import { isDatabaseUnavailable } from '../prisma/database-errors.js';
 import { RequestValidationError } from './request-validation.js';
 
 export type ErrorStatusTable = Readonly<Record<string, number>>;
@@ -30,7 +31,11 @@ const HTTP_CODES: Readonly<Record<number, string>> = {
   415: 'UNSUPPORTED_MEDIA_TYPE',
 };
 
-const BUSY_RETRY_AFTER_SECONDS = 1;
+/** Errors a client should retry, and after how many seconds. */
+const RETRY_AFTER_SECONDS: Readonly<Record<string, number>> = {
+  CAPACITY_BUSY: 1,
+  DATABASE_UNAVAILABLE: 5,
+};
 
 export interface Problem {
   readonly status: number;
@@ -89,6 +94,18 @@ export class ProblemDetailsFilter implements ExceptionFilter {
       };
     }
 
+    // An outage, not a bug: nothing was written, and the same request can succeed later.
+    if (isDatabaseUnavailable(error)) {
+      this.logger.warn(
+        `Database unavailable on ${request.method} ${request.originalUrl}: ${reasonOf(error)}`,
+      );
+      return {
+        status: HttpStatus.SERVICE_UNAVAILABLE,
+        code: 'DATABASE_UNAVAILABLE',
+        detail: 'The database is temporarily unavailable; nothing was changed. Retry shortly.',
+      };
+    }
+
     return this.unexpected(error, request);
   }
 
@@ -109,8 +126,9 @@ export function sendProblem(response: Response, request: Request, problem: Probl
   if (problem.status === HttpStatus.UNAUTHORIZED) {
     response.setHeader('WWW-Authenticate', 'Bearer realm="invoice-reservation"');
   }
-  if (problem.code === 'CAPACITY_BUSY') {
-    response.setHeader('Retry-After', String(BUSY_RETRY_AFTER_SECONDS));
+  const retryAfter = RETRY_AFTER_SECONDS[problem.code];
+  if (retryAfter !== undefined) {
+    response.setHeader('Retry-After', String(retryAfter));
   }
 
   response
@@ -149,6 +167,12 @@ export function parserFailure(error: unknown): Problem | null {
     return { status: 413, code: 'PAYLOAD_TOO_LARGE', detail: 'The request body is too large.' };
   }
   return null;
+}
+
+/** Prisma puts its invocation first and the reason on the last line. */
+function reasonOf(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.trim().split('\n').at(-1) ?? text;
 }
 
 function messageOf(error: HttpException): string {

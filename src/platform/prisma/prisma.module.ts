@@ -21,6 +21,9 @@ class PrismaLifecycle implements OnApplicationShutdown {
         createPrismaClient({
           connectionString: config.database.url,
           poolSize: config.database.poolSize,
+          connectTimeoutMs: config.database.connectTimeoutMs,
+          // No query outlives the transaction it runs in.
+          queryTimeoutMs: config.database.transactionTimeoutMs,
         }),
     },
     PrismaLifecycle,

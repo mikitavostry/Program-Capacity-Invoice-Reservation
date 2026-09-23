@@ -41,6 +41,10 @@ function problems(statuses: Record<number, string>) {
   );
 }
 
+/** Every endpoint that reads or writes the database can answer this during an outage. */
+const DATABASE_UNAVAILABLE =
+  'The database is temporarily unreachable; nothing was changed. Retry after `Retry-After` seconds (`DATABASE_UNAVAILABLE`).';
+
 const AUTH_ERRORS = {
   401: 'No valid bearer token (`UNAUTHENTICATED`).',
   403: 'The token lacks the scope, or may not act on this program (`FORBIDDEN`).',
@@ -99,7 +103,11 @@ export function buildApiDocument(): OpenAPIObject {
           parameters: [programIdParameter],
           responses: {
             200: { description: 'The program’s capacity.', content: json(ref('ProgramCapacity')) },
-            ...problems({ ...AUTH_ERRORS, 404: 'Treasury has not published this program.' }),
+            ...problems({
+              ...AUTH_ERRORS,
+              404: 'Treasury has not published this program.',
+              503: DATABASE_UNAVAILABLE,
+            }),
           },
         },
       },
@@ -129,6 +137,7 @@ export function buildApiDocument(): OpenAPIObject {
               400: 'An invalid query parameter (`VALIDATION_FAILED`) or cursor (`INVALID_QUERY`).',
               ...AUTH_ERRORS,
               404: 'No such program (`PROGRAM_NOT_FOUND`).',
+              503: DATABASE_UNAVAILABLE,
             }),
           },
         },
@@ -157,7 +166,7 @@ export function buildApiDocument(): OpenAPIObject {
               409: 'It does not fit (`INSUFFICIENT_CAPACITY`), the program is suspended (`PROGRAM_NOT_ACTIVE`), the invoice holds a reservation this request does not repeat (`INVOICE_ALREADY_RESERVED`), or it was fully repaid and no new `reservationKey` was sent (`INVOICE_ALREADY_REPAID`).',
               413: 'The body is too large (`PAYLOAD_TOO_LARGE`).',
               422: 'No rate to convert the invoice’s currency (`CURRENCY_NOT_CONVERTIBLE`), or an invalid amount.',
-              503: 'The program is busy; retry after `Retry-After` seconds (`CAPACITY_BUSY`).',
+              503: 'The program is busy (`CAPACITY_BUSY`) or the database is unreachable (`DATABASE_UNAVAILABLE`); nothing was changed. Retry after `Retry-After` seconds.',
             }),
           },
         },
@@ -185,7 +194,7 @@ export function buildApiDocument(): OpenAPIObject {
               409: 'The repayment id was used for something else (`REPAYMENT_ID_REUSED`), or the reservation is already released.',
               413: 'The body is too large (`PAYLOAD_TOO_LARGE`).',
               422: 'More than is outstanding (`REPAYMENT_EXCEEDS_OUTSTANDING`), or in the wrong currency (`REPAYMENT_CURRENCY_MISMATCH`).',
-              503: 'The program is busy; retry after `Retry-After` seconds (`CAPACITY_BUSY`).',
+              503: 'The program is busy (`CAPACITY_BUSY`) or the database is unreachable (`DATABASE_UNAVAILABLE`); nothing was changed. Retry after `Retry-After` seconds.',
             }),
           },
         },
@@ -207,7 +216,10 @@ export function buildApiDocument(): OpenAPIObject {
           security: [],
           responses: {
             200: { description: 'Ready.', content: json(ref('Health')) },
-            503: { description: 'The database is unreachable.' },
+            503: {
+              description: 'The database is unreachable, or did not answer within 2 s.',
+              content: json(ref('Health')),
+            },
           },
         },
       },
