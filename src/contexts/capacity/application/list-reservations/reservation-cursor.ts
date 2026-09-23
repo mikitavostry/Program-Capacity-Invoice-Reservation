@@ -1,10 +1,5 @@
 import type { ReservationCursor } from '../ports/capacity-read-model.js';
 
-/*
- * An opaque keyset cursor: base64url of (reservedAt, reservationId). Unlike an offset, it does
- * not skip or repeat rows while new reservations arrive.
- */
-
 export function encodeReservationCursor(cursor: ReservationCursor): string {
   return Buffer.from(
     JSON.stringify([cursor.reservedAt.toISOString(), cursor.reservationId]),

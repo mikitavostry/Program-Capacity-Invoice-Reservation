@@ -1,7 +1,3 @@
-/**
- * Scopes, space-separated in the token's `scope` claim. One per operation, since different
- * systems read availability, reserve and record repayments.
- */
 export const Scopes = {
   CapacityRead: 'capacity:read',
   ReservationsWrite: 'reservations:write',

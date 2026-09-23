@@ -53,11 +53,6 @@ export class AuthenticationGuard implements CanActivate {
   }
 }
 
-/**
- * Registered globally after authentication. Default deny: the route must declare its scopes,
- * and any `:programId` in the path must be one of the caller's programs, checked here so no
- * controller can forget it.
- */
 @Injectable()
 export class AuthorizationGuard implements CanActivate {
   private readonly logger = new Logger(AuthorizationGuard.name);

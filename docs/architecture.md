@@ -603,14 +603,6 @@ stack.
 
 Every `503` means nothing was changed, so the caller can repeat the request as it is.
 
-**Starting while Kafka is down.** The service refuses to start: it cannot tell a broker that is
-briefly away from a wrong address or missing topics, and a deploy that cannot reach its feed
-should fail loudly rather than serve with a feed that never arrives. The orchestrator restarts it
-with backoff until the broker answers (the Compose stack does the same with
-`restart: unless-stopped`; it was ready about 9 s after the broker returned). A running instance
-is unaffected by a Kafka outage, as above. Starting while the database is down succeeds, and the
-instance reports unready until the database answers.
-
 ## 4. Before production
 
 Deliberately left out of this version, and needed before it handles real money:

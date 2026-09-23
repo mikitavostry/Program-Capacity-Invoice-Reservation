@@ -47,10 +47,6 @@ export class MissingTopicsError extends Error {
   }
 }
 
-/**
- * Fails startup when a topic is missing; otherwise the consumer would wait silently and every
- * send would time out, which looks like a quiet feed.
- */
 export async function assertTopicsExist(
   kafka: KafkaJS.Kafka,
   topics: readonly string[],

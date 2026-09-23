@@ -4,9 +4,6 @@
  *   npm run token                                   # every scope, every program
  *   npm run token -- --scope capacity:read --programs program-1,program-2
  *   npm run token -- --subject alice --ttl 3600
- *
- * Runs directly on Node's built-in TypeScript support; it is a development convenience and
- * refuses to run when NODE_ENV is production.
  */
 import { existsSync } from 'node:fs';
 import { parseArgs } from 'node:util';

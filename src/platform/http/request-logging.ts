@@ -4,10 +4,6 @@ import type { AuthenticatedRequest } from '../../iam/decorators.js';
 
 const logger = new Logger('HTTP');
 
-/**
- * One line per request, with the caller. Middleware, not an interceptor: interceptors run after
- * guards and would miss the refused 401s and 403s.
- */
 export function requestLogging(request: Request, response: Response, next: NextFunction): void {
   const started = performance.now();
 

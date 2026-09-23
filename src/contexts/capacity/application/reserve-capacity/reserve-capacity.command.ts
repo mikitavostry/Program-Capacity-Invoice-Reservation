@@ -15,11 +15,7 @@ export class ReserveCapacityCommand extends Command<ReserveCapacityResult> {
     readonly invoiceId: InvoiceId,
     /** In the invoice's own currency; converted to the program's if they differ. */
     readonly invoiceAmount: Money,
-    /**
-     * Names this reservation of the invoice. Optional the first time; required to reserve an
-     * invoice again once it has been fully repaid. A key is an idempotency key for good: its
-     * retries are answered with its reservation even after that one is released.
-     */
+    /** Required only to reserve an invoice again after it was fully repaid. */
     readonly reservationKey: ReservationKey | null = null,
   ) {
     super();

@@ -48,7 +48,6 @@ function parseScopes(claim: unknown): string[] {
   return claim.split(' ').filter((scope) => scope.length > 0);
 }
 
-/** No `programs` claim means no programs; all of them must be granted explicitly with `"*"`. */
 function parsePrograms(claim: unknown): '*' | ReadonlySet<string> {
   if (claim === undefined) return new Set();
   if (claim === '*') return '*';

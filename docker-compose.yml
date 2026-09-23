@@ -71,8 +71,8 @@ services:
   api:
     profiles: ['app']
     build: .
-    # The service refuses to start while Kafka is unreachable (docs/architecture.md §3.12); like
-    # an orchestrator, Compose restarts it until the broker is back.
+    # The service refuses to start while Kafka is unreachable; like an orchestrator, Compose
+    # restarts it until the broker is back.
     restart: unless-stopped
     depends_on:
       postgres:

@@ -2,7 +2,6 @@ import type { PipeTransform } from '@nestjs/common';
 import type { z } from 'zod';
 
 export interface ValidationIssue {
-  /** Where in the request, e.g. `body.amount.currency` or `query.limit`. */
   readonly path: string;
   readonly message: string;
 }

@@ -7,7 +7,6 @@ import { ConfigError, loadConfig } from './platform/config/app-config.js';
 import { APP_OPTIONS, configureApp } from './platform/http/configure-app.js';
 
 async function bootstrap(): Promise<void> {
-  // Never in production, where a stray file must not override the environment.
   if (process.env['NODE_ENV'] !== 'production' && existsSync('.env')) {
     process.loadEnvFile('.env');
   }
