@@ -95,8 +95,9 @@ model TreasuryEvent {
 model OutboxEvent {
   /// The published message's `eventId`; consumers use it to drop redeliveries.
   id          String    @id @db.Uuid
-  /// Insertion order, including between events written in the same transaction.
-  position    BigInt    @unique @default(autoincrement())
+  /// Insertion order, including between events written in the same transaction. Unique by its
+  /// sequence; indexed only while unpublished, which is all the relay reads.
+  position    BigInt    @default(autoincrement())
   programId   String    @map("program_id")
   eventType   String    @map("event_type")
   /// The message exactly as it will be published.
@@ -138,10 +139,9 @@ model Reservation {
   /// An invoice may hold at most one live reservation against a program.
   @@unique([programId, invoiceId], map: "reservations_one_active_per_invoice", where: raw("status = 'ACTIVE'"))
   /// A key names one reservation of an invoice. NULLs are distinct, so unkeyed rows never clash.
+  /// Also serves lookups by program and invoice alone, such as whether an invoice was repaid.
   @@unique([programId, invoiceId, reservationKey])
   @@index([programId, reservedAt])
-  /// Whether an invoice was reserved before, including released reservations.
-  @@index([programId, invoiceId])
   @@map("reservations")
 }
 

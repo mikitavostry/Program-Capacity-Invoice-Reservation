@@ -263,7 +263,7 @@ PostgreSQL through Prisma. Domain objects and Prisma rows are converted by expli
 erDiagram
     outbox_events {
         uuid id PK "the published eventId"
-        bigint position UK "publish order"
+        bigint position "publish order; indexed while unpublished"
         text program_id "message key; no FK"
         text event_type
         jsonb payload
