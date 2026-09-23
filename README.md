@@ -26,18 +26,15 @@ The project is ESM, so relative imports carry a `.js` extension
 
 ## Running it
 
-Two ways, both driven by npm scripts. Prerequisites: Docker (with Compose) and Node.js 22.19 or
-newer. Install dependencies once, and create the local config:
-
-```bash
-npm ci
-cp .env.example .env
-```
+Two ways, both driven by npm scripts.
 
 ### Option A: everything in Docker
 
 The API, Postgres, Kafka, the topics, the migrations and two demo programs (`program-1`,
 10,000,000 USD; `program-2`, 5,000,000 EUR, published by a stand-in treasury).
+
+Needs only Docker (with Compose) and npm to run the scripts: no install step and no `.env`.
+Dependencies are installed inside the image, and the configuration is in `docker-compose.yml`.
 
 | Step | Command |
 | --- | --- |
@@ -49,7 +46,13 @@ The API, Postgres, Kafka, the topics, the migrations and two demo programs (`pro
 
 ### Option B: the app on your machine, infrastructure in Docker
 
-Hot reload, and `.env` for configuration.
+Hot reload, and `.env` for configuration. Needs Docker (with Compose) and Node.js 22.19 or newer.
+Install dependencies once, and create the local config:
+
+```bash
+npm ci
+cp .env.example .env
+```
 
 | Step | Command |
 | --- | --- |
@@ -201,6 +204,8 @@ docker compose exec redpanda rpk topic consume capacity.events --offset start
 Details and the message format: [architecture §3.11](docs/architecture.md#311-published-events-transactional-outbox).
 
 ## Tests
+
+The tests run on your machine, so install dependencies first with `npm ci` (no `.env` needed).
 
 ```bash
 npm test                 # unit — no infrastructure needed
