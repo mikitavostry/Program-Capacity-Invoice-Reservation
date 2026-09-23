@@ -11,11 +11,7 @@ import { InvoiceId, ProgramId, ReservationId } from '../../../domain/ids.js';
 import { Program } from '../../../domain/program.js';
 import { Reservation } from '../../../domain/reservation.js';
 
-/*
- * Rows and aggregates are different types on purpose. Prisma's models describe table shape;
- * the aggregates describe behaviour. Every crossing goes through `rehydrate`, so a row that
- * breaks an invariant fails here, loudly, instead of becoming an aggregate that lies.
- */
+/* Rows become aggregates only through `rehydrate`, so a corrupt row fails loudly here. */
 
 export type ProgramRow = Pick<
   ProgramRecord,
@@ -41,11 +37,7 @@ export function toProgram(row: ProgramRow): Program {
   });
 }
 
-/**
- * Sequences are BIGINT in the database and a plain number in the domain. Anything beyond
- * exact representation is refused rather than silently rounded — at one message a second it
- * would take almost three hundred million years to get there, so this should never fire.
- */
+/** BIGINT in the database, a number in the domain: refuse rather than round past 2^53. */
 function toSequence(programId: string, sequence: bigint): number {
   const value = Number(sequence);
   if (!Number.isSafeInteger(value)) {
@@ -98,7 +90,7 @@ export function fromReservation(reservation: Reservation): Prisma.ReservationUnc
     invoiceMinor: reservation.invoiceAmount.minorUnits,
     reservedCurrency: reservation.reservedAmount.currency.code,
     reservedMinor: reservation.reservedAmount.minorUnits,
-    // Passed as a decimal string so the rate never passes through a float on its way in.
+    // A decimal string, so the rate never passes through a float.
     exchangeRate: rate === null ? null : rate.rate,
     rateAsOf: rate === null ? null : rate.asOf,
     repaidMinor: reservation.repaidAmount.minorUnits,

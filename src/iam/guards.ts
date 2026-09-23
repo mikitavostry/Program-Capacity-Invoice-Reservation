@@ -25,7 +25,6 @@ function isPublic(reflector: Reflector, context: ExecutionContext): boolean {
   );
 }
 
-/** Establishes who is calling. Registered globally: every route runs it unless `@Public()`. */
 @Injectable()
 export class AuthenticationGuard implements CanActivate {
   constructor(
@@ -44,8 +43,7 @@ export class AuthenticationGuard implements CanActivate {
       request.principal = await this.tokens.verify(token);
     } catch (error) {
       if (error instanceof InvalidTokenError) {
-        // The reason goes to the logs, not the caller: telling an attacker exactly which check
-        // failed helps them more than it helps a legitimate client.
+        // The reason is logged, not returned: it would help an attacker more than a client.
         throw new UnauthorizedException('The bearer token is not valid.', { cause: error });
       }
       throw error;
@@ -56,11 +54,9 @@ export class AuthenticationGuard implements CanActivate {
 }
 
 /**
- * Decides whether the caller may do this. Registered globally after authentication.
- *
- * Two rules, both default-deny: the route must declare the scopes it needs, and any route
- * addressing a program by `:programId` is checked against the programs the caller may touch.
- * That second check needs no code in the controller, so no controller can forget it.
+ * Registered globally after authentication. Default deny: the route must declare its scopes,
+ * and any `:programId` in the path must be one of the caller's programs, checked here so no
+ * controller can forget it.
  */
 @Injectable()
 export class AuthorizationGuard implements CanActivate {

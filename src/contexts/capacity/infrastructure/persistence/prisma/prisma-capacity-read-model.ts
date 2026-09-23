@@ -12,11 +12,7 @@ import {
 import type { ProgramId } from '../../../domain/ids.js';
 import { toProgram, toReservation } from './mappers.js';
 
-/**
- * Reads go through the same mappers as writes, so a view is built from a rehydrated aggregate
- * and a corrupt row fails here too instead of being displayed. At page sizes of a hundred the
- * cost is negligible; a hot read path could later read columns straight into views.
- */
+/** Views are built from rehydrated aggregates, so a corrupt row fails instead of being shown. */
 export class PrismaCapacityReadModel implements CapacityReadModel {
   constructor(private readonly prisma: PrismaClient) {}
 

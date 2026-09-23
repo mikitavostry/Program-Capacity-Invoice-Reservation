@@ -4,7 +4,7 @@ import type { Reservation } from '../reservation.js';
 export interface ReservationRepository {
   findById(id: ReservationId): Promise<Reservation | null>;
 
-  /** The reservation an invoice currently holds against a program, if any — at most one. */
+  /** An invoice holds at most one active reservation per program. */
   findActiveByInvoice(programId: ProgramId, invoiceId: InvoiceId): Promise<Reservation | null>;
 
   insert(reservation: Reservation): Promise<void>;

@@ -3,7 +3,6 @@ import { errors, jwtVerify, type JWTPayload } from 'jose';
 import { APP_CONFIG, type AppConfig } from '../platform/config/app-config.js';
 import type { Principal } from './principal.js';
 
-/** Why a token was refused. Kept deliberately coarse in what reaches the caller. */
 export class InvalidTokenError extends Error {
   constructor(readonly reason: string) {
     super(`Invalid bearer token: ${reason}`);
@@ -12,12 +11,8 @@ export class InvalidTokenError extends Error {
 }
 
 /**
- * Verifies HS256 bearer tokens: signature, expiry, issuer and audience, with the algorithm
- * pinned so a token cannot choose its own.
- *
- * A shared secret keeps local runs self-contained. Behind a real identity provider this would
- * verify asymmetric tokens against its JWKS instead — with `jose` that is a change to how the
- * key is obtained, confined to this class.
+ * Verifies HS256 bearer tokens (signature, expiry, issuer, audience; algorithm pinned). With a
+ * real identity provider this would verify against its JWKS instead, a change confined here.
  */
 @Injectable()
 export class TokenVerifier {
@@ -53,11 +48,7 @@ function parseScopes(claim: unknown): string[] {
   return claim.split(' ').filter((scope) => scope.length > 0);
 }
 
-/**
- * A token with no `programs` claim may act on no program at all. Access to every program has
- * to be granted explicitly with `"*"`, so a token minted without thinking about it is not
- * accidentally all-powerful.
- */
+/** No `programs` claim means no programs; all of them must be granted explicitly with `"*"`. */
 function parsePrograms(claim: unknown): '*' | ReadonlySet<string> {
   if (claim === undefined) return new Set();
   if (claim === '*') return '*';

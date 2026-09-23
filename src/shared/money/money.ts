@@ -3,6 +3,9 @@ import { ValueObject } from '../domain/value-object.js';
 import { Currency } from './currency.js';
 import { formatScaledDecimal, parseScaledDecimal } from './decimal.js';
 
+/** The largest amount, in minor units, a Postgres `BIGINT` column holds. */
+export const MAX_MINOR_UNITS = 2n ** 63n - 1n;
+
 export class InvalidAmountError extends DomainError {
   readonly code = 'INVALID_AMOUNT';
 
@@ -19,16 +22,6 @@ export class CurrencyMismatchError extends DomainError {
   }
 }
 
-/**
- * A monetary amount: an exact count of minor units, paired with the currency counting them.
- *
- * Amounts are integers held as `bigint` and never touch floating point, because a credit
- * limit that drifts by a rounding error is a defect that shows up as missing money rather
- * than as a stack trace. Arithmetic across currencies throws instead of coercing, so an
- * unconverted amount cannot quietly find its way into a total.
- *
- * Instances are immutable; every operation returns a new one.
- */
 export class Money extends ValueObject {
   readonly minorUnits: bigint;
   readonly currency: Currency;
@@ -59,7 +52,6 @@ export class Money extends ValueObject {
     return new Money(BigInt(minorUnits), currency);
   }
 
-  /** Builds an amount from a decimal string such as `"1234.56"`. */
   static fromDecimal(amount: string, currency: Currency): Money {
     const parsed = parseScaledDecimal(amount, currency.minorUnitDigits);
 

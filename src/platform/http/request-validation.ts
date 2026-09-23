@@ -14,11 +14,6 @@ export class RequestValidationError extends Error {
   }
 }
 
-/**
- * Parses one part of a request with a zod schema, handing the controller a typed value — with
- * amounts already turned into `Money` — or rejecting with every problem found, not just the
- * first.
- */
 export class ZodPipe<Schema extends z.ZodType> implements PipeTransform<unknown, z.output<Schema>> {
   constructor(
     private readonly schema: Schema,

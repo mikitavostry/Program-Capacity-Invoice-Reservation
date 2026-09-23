@@ -11,7 +11,6 @@ services:
       - '${POSTGRES_PORT:-5433}:5432'
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U capacity -d capacity']
       interval: 2s
@@ -28,8 +27,13 @@ services:
       - --smp=1
       - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
       - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:${KAFKA_PORT:-19092}
+      # Kafka over HTTP, so tools without a Kafka client (the Postman collection) can play
+      # treasury and publish to the feed.
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:${KAFKA_HTTP_PORT:-18082}
     ports:
       - '${KAFKA_PORT:-19092}:19092'
+      - '${KAFKA_HTTP_PORT:-18082}:18082'
     volumes:
       - redpanda-data:/var/lib/redpanda/data
     healthcheck:
@@ -38,18 +42,17 @@ services:
       timeout: 5s
       retries: 30
 
-  # Topics are expected to exist before the service starts, exactly as they would be
-  # provisioned in a real environment. Runs once and exits.
+  # Topics are provisioned before the service starts, with explicit partitions and retention,
+  # as a real environment does; the service never creates them. Runs once and exits.
   kafka-topics:
     profiles: ['app']
     image: redpandadata/redpanda:v25.2.5
     depends_on:
       redpanda:
         condition: service_healthy
-    entrypoint: ['/bin/sh', '-c']
-    command: >
-      "rpk topic create treasury.program-capacity treasury.program-capacity.dead-letter
-       --brokers redpanda:9092 || true"
+    volumes:
+      - ./docker/redpanda/create-topics.sh:/create-topics.sh:ro
+    entrypoint: ['/bin/sh', '/create-topics.sh']
     restart: 'no'
 
   # Applies migrations before the API starts, so the schema is never half a step behind the
@@ -77,6 +80,9 @@ services:
         condition: service_completed_successfully
       kafka-topics:
         condition: service_completed_successfully
+      # Its messages wait in the topic; the API opens the demo programs from them on startup.
+      treasury-seed:
+        condition: service_completed_successfully
     environment:
       # Local demo values. NODE_ENV stays development so `npm run token` works inside the
       # container; production configuration is stricter and is covered by its own tests.
@@ -90,6 +96,7 @@ services:
       KAFKA_BROKERS: redpanda:9092
       KAFKA_TREASURY_TOPIC: treasury.program-capacity
       KAFKA_DEAD_LETTER_TOPIC: treasury.program-capacity.dead-letter
+      KAFKA_CAPACITY_EVENTS_TOPIC: capacity.events
     ports:
       - '${PORT:-3000}:3000'
     healthcheck:
@@ -104,6 +111,40 @@ services:
       timeout: 5s
       retries: 20
       start_period: 10s
+
+  # Plays the treasury system once at startup: publishes the demo programs, which the API
+  # opens from the feed. Fixed event ids make a restart publish duplicates, which are ignored.
+  treasury-seed:
+    profiles: ['app']
+    build: .
+    depends_on:
+      kafka-topics:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: development
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TREASURY_TOPIC: treasury.program-capacity
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - >-
+        node --disable-warning=ExperimentalWarning scripts/publish-treasury-message.ts
+        --program program-1 --limit 10000000.00 --currency USD --sequence 1 --event-id seed-program-1 &&
+        node --disable-warning=ExperimentalWarning scripts/publish-treasury-message.ts
+        --program program-2 --limit 5000000.00 --currency EUR --sequence 1 --event-id seed-program-2
+    restart: 'no'
+
+  # Web UI for the broker at http://localhost:8080: browse topics, read the dead letters, and
+  # produce treasury messages by hand.
+  kafka-console:
+    profiles: ['app', 'tools']
+    image: redpandadata/console:v2.8.5
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - '${KAFKA_CONSOLE_PORT:-8080}:8080'
 
 volumes:
   postgres-data:

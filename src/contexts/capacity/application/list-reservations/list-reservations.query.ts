@@ -9,7 +9,6 @@ export const MAX_PAGE_SIZE = 100;
 export interface ListReservationsOptions {
   readonly status?: ReservationStatus | null;
   readonly limit?: number;
-  /** A `nextCursor` from a previous page. */
   readonly cursor?: string | null;
 }
 

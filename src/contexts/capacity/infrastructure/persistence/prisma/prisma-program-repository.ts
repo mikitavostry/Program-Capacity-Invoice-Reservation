@@ -11,9 +11,8 @@ export class PrismaProgramRepository implements ProgramRepository {
   constructor(private readonly tx: Prisma.TransactionClient) {}
 
   async lockById(id: ProgramId): Promise<Program | null> {
-    // Locks and reads in one round trip. Prisma's query API has no FOR UPDATE, which is the
-    // only reason this is raw SQL; the aliases shape the row like the generated model so
-    // both paths share one mapper.
+    // Raw SQL because Prisma's query API has no FOR UPDATE. Aliases match the generated model,
+    // so both paths share one mapper.
     const rows = await this.tx.$queryRaw<ProgramRow[]>`
       SELECT id,
              currency,

@@ -26,12 +26,12 @@ export class ListReservationsHandler implements IQueryHandler<ListReservationsQu
       throw new InvalidQueryError('The cursor is not one this service issued.');
     }
 
-    // Distinguishes "no such program" from "a program with no reservations yet".
+    // 404 for an unknown program rather than an empty page.
     if ((await this.readModel.getProgramCapacity(query.programId)) === null) {
       throw new ProgramNotFoundError(query.programId);
     }
 
-    // One more than asked for, to learn whether another page exists without counting.
+    // One extra row tells whether another page exists.
     const rows = await this.readModel.listReservations({
       programId: query.programId,
       status: query.options.status ?? null,

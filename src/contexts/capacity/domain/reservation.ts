@@ -20,7 +20,7 @@ export interface ReservationSnapshot {
   readonly invoiceAmount: Money;
   /** The capacity held against the program when the reservation was made, in its currency. */
   readonly reservedAmount: Money;
-  /** The rate used to get from one to the other; `null` when no conversion was needed. */
+  /** Invoice currency → program currency; `null` when they are the same. */
   readonly exchangeRate: ExchangeRate | null;
   /** Repaid so far, in the invoice's currency. */
   readonly repaidAmount: Money;
@@ -39,19 +39,12 @@ export type NewReservation = Omit<
 >;
 
 /**
- * The record of one hold against a program's capacity, and of the repayments that wind it
- * down — an aggregate root in its own right, referring to its program by identity only.
+ * One invoice's hold on a program's capacity, and the repayments that wind it down.
  *
- * Repayments may arrive in instalments. The capacity freed by each one is derived from the
- * running total repaid rather than from the instalment alone, and rounds down, so no
- * sequence of instalments can free more than the repaid share. The final repayment frees
- * exactly what is still held. Together those guarantee the total released equals the total
- * reserved, to the minor unit, however the repayments were split.
- *
- * New reservations are minted by `Program.reserveFor` and repaid through `Program.release`,
- * which keep the program's counter in step. Calling `open` or `recordRepayment` here
- * directly would bypass that counter; the drift check against the ledger exists to catch
- * exactly that.
+ * Each release is computed from the running total repaid, rounding down, and the final
+ * repayment frees exactly what is left, so the total released equals the total reserved to
+ * the minor unit however the repayments were split. Create and repay reservations through
+ * `Program`, which keeps its counter in step.
  */
 export class Reservation extends AggregateRoot<ReservationId> {
   readonly programId: ProgramId;
@@ -138,8 +131,8 @@ export class Reservation extends AggregateRoot<ReservationId> {
   }
 
   /**
-   * Applies a repayment, in the invoice's currency, and returns the capacity it frees in the
-   * program's currency. That can be zero for a small instalment against a converted invoice.
+   * Applies a repayment in the invoice's currency and returns the capacity it frees in the
+   * program's; zero for an instalment worth less than one minor unit after conversion.
    */
   recordRepayment(repayment: Money, at: Date): Money {
     if (this.#status === 'RELEASED') {
@@ -201,13 +194,7 @@ export class Reservation extends AggregateRoot<ReservationId> {
     };
   }
 
-  /**
-   * The total capacity that should have been freed once `repaid` of the invoice is repaid.
-   *
-   * Computed from the running total, never per instalment, so rounding happens once rather
-   * than accumulating. Full repayment frees exactly what was reserved, absorbing the
-   * difference between rounding the hold up and rounding partial releases down.
-   */
+  /** Total capacity freed once `repaid` is repaid; rounding never accumulates per instalment. */
   private capacityReleasedOnceRepaid(repaid: Money): Money {
     if (repaid.equals(this.invoiceAmount)) return this.reservedAmount;
     if (this.exchangeRate === null) return repaid;
@@ -251,7 +238,6 @@ function assertConsistent(state: ReservationSnapshot): void {
     );
   }
 
-  // Currencies first, so the range checks below cannot trip over a mismatch instead.
   if (
     !state.repaidAmount.currency.equals(state.invoiceAmount.currency) ||
     !state.releasedAmount.currency.equals(state.reservedAmount.currency)

@@ -2,7 +2,7 @@
   "info": {
     "name": "Invoice Reservation — Program Capacity",
     "_postman_id": "6f1f9d8e-0c2a-4a5e-9f3c-1a2b3c4d5e6f",
-    "description": "Every request in this collection asserts what it expects, so **Run collection** exercises the\nwhole service and reports pass/fail.\n\n### Before you start\n\n```bash\ndocker compose --profile app up -d --build\n```\n\nNothing else is needed: the collection mints its own bearer tokens from `jwtSecret`, which\nmatches the secret the Docker stack runs with. Point `baseUrl` elsewhere and set `jwtSecret`,\n`jwtIssuer` and `jwtAudience` to match if you are testing another environment.\n\nRequests run in order and share state — the first one opens a program with a fresh id each run,\nand later ones reserve against it — so run the collection top to bottom rather than one request\nin isolation.\n\n### What it covers\n\n- opening a program, and the same request repeated (idempotency)\n- reserving capacity in the program currency and in another currency (FX conversion)\n- partial and full repayments, including replays and misuse of a repayment id\n- paging through reservations with a cursor\n- every refusal: insufficient capacity, validation, 401, 403\n\nThe Kafka treasury feed is not HTTP, so it is not in here — see the README for\n`npm run treasury`.",
+    "description": "Every request in this collection asserts what it expects, so **Run collection** exercises the\nwhole service and reports pass/fail.\n\n### Before you start\n\n```bash\ndocker compose --profile app up -d --build --wait\n```\n\nNothing else is needed:\n\n- the collection mints its own bearer tokens from `jwtSecret`, which matches the secret the\n  Docker stack runs with;\n- it plays the treasury system itself: programs are published to the Kafka feed through\n  Redpanda's HTTP proxy (`kafkaProxyUrl`), and the service opens them from the feed.\n\nRequests run in order and share state — the Programs folder publishes a program with a fresh id\neach run, and later requests reserve against it — so run the collection top to bottom rather\nthan one request in isolation.\n\n### What it covers\n\n- a program published by treasury over Kafka, and seen through the API once the feed applies it\n- reserving capacity in the program currency and in another currency (FX conversion)\n- partial and full repayments, including replays and misuse of a repayment id\n- paging through reservations with a cursor\n- every refusal: insufficient capacity, validation, 401, 403\n- treasury raising the limit, and a periodic reconciliation\n- treasury suspending the program (new reservations refused) and reactivating it",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -21,26 +21,30 @@
       "script": {
         "type": "text/javascript",
         "exec": [
+          "const cryptoJs = require(\"crypto-js\");",
+          "",
           "const secret = pm.collectionVariables.get(\"jwtSecret\");",
           "const issuer = pm.collectionVariables.get(\"jwtIssuer\");",
           "const audience = pm.collectionVariables.get(\"jwtAudience\");",
           "",
-          "const b64url = (words) => CryptoJS.enc.Base64.stringify(words)",
+          "const b64url = (words) => cryptoJs.enc.Base64.stringify(words)",
           "  .replace(/\\+/g, \"-\").replace(/\\//g, \"_\").replace(/=+$/, \"\");",
-          "const encode = (value) => b64url(CryptoJS.enc.Utf8.parse(JSON.stringify(value)));",
+          "const encode = (value) => b64url(cryptoJs.enc.Utf8.parse(JSON.stringify(value)));",
           "",
           "function sign(claims) {",
           "  const now = Math.floor(Date.now() / 1000);",
           "  const header = encode({ alg: \"HS256\", typ: \"JWT\" });",
           "  const payload = encode({ iss: issuer, aud: audience, iat: now, exp: now + 3600, ...claims });",
-          "  const signature = b64url(CryptoJS.HmacSHA256(header + \".\" + payload, secret));",
+          "  const signature = b64url(cryptoJs.HmacSHA256(header + \".\" + payload, secret));",
           "  return `${header}.${payload}.${signature}`;",
           "}",
           "",
-          "const everything = \"capacity:read capacity:write programs:admin\";",
+          "const everything = \"capacity:read reservations:write repayments:write\";",
           "pm.collectionVariables.set(\"token\", sign({ sub: \"postman\", scope: everything, programs: \"*\" }));",
           "pm.collectionVariables.set(\"readOnlyToken\", sign({ sub: \"postman-reader\", scope: \"capacity:read\", programs: \"*\" }));",
-          "pm.collectionVariables.set(\"writerToken\", sign({ sub: \"postman-writer\", scope: \"capacity:read capacity:write\", programs: \"*\" }));",
+          "// One per system: the invoice approver reserves, the payments system records repayments.",
+          "pm.collectionVariables.set(\"approverToken\", sign({ sub: \"postman-approver\", scope: \"capacity:read reservations:write\", programs: \"*\" }));",
+          "pm.collectionVariables.set(\"repayerToken\", sign({ sub: \"postman-repayer\", scope: \"capacity:read repayments:write\", programs: \"*\" }));",
           "pm.collectionVariables.set(\"otherProgramToken\", sign({ sub: \"postman-outsider\", scope: everything, programs: [\"some-other-program\"] }));",
           "// Same token with the signature broken, for the request that expects it to be refused.",
           "pm.collectionVariables.set(\"tamperedToken\", pm.collectionVariables.get(\"token\") + \"tampered\");"
@@ -64,6 +68,14 @@
     {
       "key": "jwtAudience",
       "value": "invoice-reservation-api"
+    },
+    {
+      "key": "kafkaProxyUrl",
+      "value": "http://localhost:18082"
+    },
+    {
+      "key": "treasuryTopic",
+      "value": "treasury.program-capacity"
     },
     {
       "key": "programId",
@@ -102,7 +114,11 @@
       "value": ""
     },
     {
-      "key": "writerToken",
+      "key": "approverToken",
+      "value": ""
+    },
+    {
+      "key": "repayerToken",
       "value": ""
     },
     {
@@ -112,6 +128,10 @@
     {
       "key": "tamperedToken",
       "value": ""
+    },
+    {
+      "key": "waitAttempts",
+      "value": "0"
     }
   ],
   "item": [
@@ -191,10 +211,11 @@
     },
     {
       "name": "2. Programs",
-      "description": "Opening a program is idempotent on the id the caller chooses.",
+      "description": "Programs are defined by the treasury system: its first Kafka message for a program id opens the program here. Over HTTP a program can only be read.",
       "item": [
         {
-          "name": "Open a program",
+          "name": "Treasury publishes a new program",
+          "description": "Plays the treasury system: publishes a program with a fresh id and a 10,000,000 USD limit to the Kafka feed.",
           "event": [
             {
               "listen": "prerequest",
@@ -205,7 +226,22 @@
                   "pm.collectionVariables.set(\"programId\", \"postman-\" + Date.now());",
                   "pm.collectionVariables.set(\"usdInvoiceId\", \"invoice-usd-\" + Date.now());",
                   "pm.collectionVariables.set(\"eurInvoiceId\", \"invoice-eur-\" + Date.now());",
-                  "pm.collectionVariables.set(\"repaymentId\", \"repayment-\" + Date.now());"
+                  "pm.collectionVariables.set(\"repaymentId\", \"repayment-\" + Date.now());",
+                  "pm.collectionVariables.set(\"waitAttempts\", 0);",
+                  "",
+                  "// Treasury's wire format. The sequence is the clock in milliseconds, so every message",
+                  "// this collection sends is newer than the one before it.",
+                  "const message = {",
+                  "  eventId: \"postman-\" + Date.now() + \"-\" + Math.random().toString(36).slice(2),",
+                  "  eventType: \"program.capacity.changed\",",
+                  "  occurredAt: new Date().toISOString(),",
+                  "  sequence: Date.now(),",
+                  "  program: {",
+                  "    id: pm.collectionVariables.get(\"programId\"),",
+                  "    creditLimit: { amount: \"10000000.00\", currency: \"USD\" },",
+                  "  },",
+                  "};",
+                  "pm.variables.set(\"treasuryMessage\", JSON.stringify(message));"
                 ]
               }
             },
@@ -214,148 +250,72 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"201 — created, with the whole limit available\", () => {",
-                  "  pm.response.to.have.status(201);",
-                  "  const body = pm.response.json();",
-                  "  pm.expect(body.availableCapacity).to.eql({ amount: \"10000000.00\", currency: \"USD\" });",
-                  "  pm.expect(body.reservedAmount.amount).to.eql(\"0.00\");",
-                  "  pm.expect(body.status).to.eql(\"ACTIVE\");",
-                  "});"
-                ]
-              }
-            }
-          ],
-          "request": {
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"programId\": \"{{programId}}\",\n  \"creditLimit\": {\n    \"amount\": \"10000000.00\",\n    \"currency\": \"USD\"\n  }\n}",
-              "options": {
-                "raw": {
-                  "language": "json"
-                }
-              }
-            },
-            "url": {
-              "raw": "{{baseUrl}}/programs",
-              "host": [
-                "{{baseUrl}}"
-              ],
-              "path": [
-                "programs"
-              ]
-            }
-          }
-        },
-        {
-          "name": "Open it again, identically",
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "pm.test(\"200 — recognised as a repeat, not created twice\", () => {",
+                  "pm.test(\"200 — accepted by the broker\", () => {",
                   "  pm.response.to.have.status(200);",
-                  "  pm.expect(pm.response.json().programId).to.eql(pm.collectionVariables.get(\"programId\"));",
+                  "  const [offset] = pm.response.json().offsets;",
+                  "  pm.expect(offset.error_code, \"Kafka error\").to.be.undefined;",
                   "});"
                 ]
               }
             }
           ],
           "request": {
+            "auth": {
+              "type": "noauth"
+            },
             "method": "POST",
             "header": [
               {
                 "key": "Content-Type",
-                "value": "application/json"
+                "value": "application/vnd.kafka.json.v2+json"
               }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"programId\": \"{{programId}}\",\n  \"creditLimit\": {\n    \"amount\": \"10000000.00\",\n    \"currency\": \"USD\"\n  }\n}",
-              "options": {
-                "raw": {
-                  "language": "json"
-                }
-              }
+              "raw": "{\n  \"records\": [\n    { \"key\": \"{{programId}}\", \"value\": {{treasuryMessage}} }\n  ]\n}"
             },
             "url": {
-              "raw": "{{baseUrl}}/programs",
+              "raw": "{{kafkaProxyUrl}}/topics/{{treasuryTopic}}",
               "host": [
-                "{{baseUrl}}"
+                "{{kafkaProxyUrl}}"
               ],
               "path": [
-                "programs"
+                "topics",
+                "{{treasuryTopic}}"
               ]
             }
           }
         },
         {
-          "name": "Open it again with a different limit",
+          "name": "Get capacity once the feed has opened it",
+          "description": "The feed is asynchronous, so this asks again every half second until the program exists.",
           "event": [
             {
               "listen": "test",
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"409 — the id is taken and this is not a retry\", () => {",
-                  "  pm.response.to.have.status(409);",
-                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
-                  "  pm.expect(pm.response.json().code).to.eql(\"PROGRAM_ALREADY_EXISTS\");",
-                  "});"
-                ]
-              }
-            }
-          ],
-          "request": {
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"programId\": \"{{programId}}\",\n  \"creditLimit\": {\n    \"amount\": \"5000000.00\",\n    \"currency\": \"USD\"\n  }\n}",
-              "options": {
-                "raw": {
-                  "language": "json"
-                }
-              }
-            },
-            "url": {
-              "raw": "{{baseUrl}}/programs",
-              "host": [
-                "{{baseUrl}}"
-              ],
-              "path": [
-                "programs"
-              ]
-            }
-          }
-        },
-        {
-          "name": "Get capacity",
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "pm.test(\"200 — limit, reserved and available\", () => {",
-                  "  pm.response.to.have.status(200);",
-                  "  const body = pm.response.json();",
-                  "  pm.expect(body.creditLimit.amount).to.eql(\"10000000.00\");",
-                  "  pm.expect(body.availableCapacity.amount).to.eql(\"10000000.00\");",
-                  "});"
+                  "const attempts = Number(pm.collectionVariables.get(\"waitAttempts\") || 0);",
+                  "const body = pm.response.code === 200 ? pm.response.json() : null;",
+                  "const ready = body !== null && (body.creditLimit.amount === \"10000000.00\");",
+                  "",
+                  "if (!ready && attempts < 40) {",
+                  "  // Not consumed yet: ask again shortly.",
+                  "  pm.collectionVariables.set(\"waitAttempts\", attempts + 1);",
+                  "  setTimeout(() => {}, 500);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set(\"waitAttempts\", 0);",
+                  "  pm.test(\"the treasury feed applied the message\", () => {",
+                  "    pm.expect(ready, \"still not applied after 20 s — is the service consuming the feed (KAFKA_ENABLED=true)?\").to.be.true;",
+                  "  });",
+                  "  pm.test(\"200 — the whole limit available, nothing reserved\", () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.availableCapacity).to.eql({ amount: \"10000000.00\", currency: \"USD\" });",
+                  "    pm.expect(body.reservedAmount.amount).to.eql(\"0.00\");",
+                  "    pm.expect(body.status).to.eql(\"ACTIVE\");",
+                  "  });",
+                  "}"
                 ]
               }
             }
@@ -372,6 +332,50 @@
                 "programs",
                 "{{programId}}",
                 "capacity"
+              ]
+            }
+          }
+        },
+        {
+          "name": "There is no endpoint for opening a program",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404 — programs come from treasury, not from HTTP\", () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"programId\": \"postman-should-not-exist\",\n  \"creditLimit\": { \"amount\": \"1.00\", \"currency\": \"USD\" }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs"
               ]
             }
           }
@@ -445,7 +449,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"invoiceId\": \"{{usdInvoiceId}}\",\n  \"amount\": {\n    \"amount\": \"250000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "raw": "{\n  \"invoiceId\": \"{{usdInvoiceId}}\",\n  \"invoiceAmount\": {\n    \"amount\": \"250000.00\",\n    \"currency\": \"USD\"\n  }\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -491,7 +495,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"invoiceId\": \"{{usdInvoiceId}}\",\n  \"amount\": {\n    \"amount\": \"250000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "raw": "{\n  \"invoiceId\": \"{{usdInvoiceId}}\",\n  \"invoiceAmount\": {\n    \"amount\": \"250000.00\",\n    \"currency\": \"USD\"\n  }\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -538,7 +542,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"invoiceId\": \"{{usdInvoiceId}}\",\n  \"amount\": {\n    \"amount\": \"300000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "raw": "{\n  \"invoiceId\": \"{{usdInvoiceId}}\",\n  \"invoiceAmount\": {\n    \"amount\": \"300000.00\",\n    \"currency\": \"USD\"\n  }\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -588,7 +592,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"invoiceId\": \"{{eurInvoiceId}}\",\n  \"amount\": {\n    \"amount\": \"100000.00\",\n    \"currency\": \"EUR\"\n  }\n}",
+              "raw": "{\n  \"invoiceId\": \"{{eurInvoiceId}}\",\n  \"invoiceAmount\": {\n    \"amount\": \"100000.00\",\n    \"currency\": \"EUR\"\n  }\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -638,7 +642,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"invoiceId\": \"invoice-too-big\",\n  \"amount\": {\n    \"amount\": \"20000000.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "raw": "{\n  \"invoiceId\": \"invoice-too-big\",\n  \"invoiceAmount\": {\n    \"amount\": \"20000000.00\",\n    \"currency\": \"USD\"\n  }\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -672,7 +676,7 @@
                   "  pm.expect(pm.response.json().code).to.eql(\"VALIDATION_FAILED\");",
                   "  const paths = pm.response.json().issues.map((issue) => issue.path);",
                   "  pm.expect(paths).to.include(\"body.invoiceId\");",
-                  "  pm.expect(paths).to.include(\"body.amount.amount\");",
+                  "  pm.expect(paths).to.include(\"body.invoiceAmount.amount\");",
                   "});"
                 ]
               }
@@ -688,7 +692,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"invoiceId\": \"has spaces\",\n  \"amount\": {\n    \"amount\": 12.5,\n    \"currency\": \"USD\"\n  },\n  \"ammount\": \"1\"\n}",
+              "raw": "{\n  \"invoiceId\": \"has spaces\",\n  \"invoiceAmount\": {\n    \"amount\": 12.5,\n    \"currency\": \"USD\"\n  },\n  \"ammount\": \"1\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1232,7 +1236,7 @@
     },
     {
       "name": "5. Authentication and authorization",
-      "description": "Every route needs a token; every route also states the scope it needs, and a token grants access only to the programs it names.",
+      "description": "Every route needs a token; every route also states the scope it needs — capacity:read, reservations:write or repayments:write — and a token grants access only to the programs it names.",
       "item": [
         {
           "name": "No token at all",
@@ -1360,11 +1364,11 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"403 — writing needs capacity:write\", () => {",
+                  "pm.test(\"403 — reserving needs reservations:write\", () => {",
                   "  pm.response.to.have.status(403);",
                   "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
                   "  pm.expect(pm.response.json().code).to.eql(\"FORBIDDEN\");",
-                  "  pm.expect(pm.response.json().detail).to.include(\"capacity:write\");",
+                  "  pm.expect(pm.response.json().detail).to.include(\"reservations:write\");",
                   "});"
                 ]
               }
@@ -1380,7 +1384,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"invoiceId\": \"invoice-denied\",\n  \"amount\": {\n    \"amount\": \"1.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "raw": "{\n  \"invoiceId\": \"invoice-denied\",\n  \"invoiceAmount\": {\n    \"amount\": \"1.00\",\n    \"currency\": \"USD\"\n  }\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1404,6 +1408,124 @@
                 {
                   "key": "token",
                   "value": "{{readOnlyToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Repayments-only token reserving capacity",
+          "description": "The payments system may release capacity, but not reserve it.",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"403 — reserving needs reservations:write\", () => {",
+                  "  pm.response.to.have.status(403);",
+                  "  pm.expect(pm.response.json().code).to.eql(\"FORBIDDEN\");",
+                  "  pm.expect(pm.response.json().detail).to.include(\"reservations:write\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"invoice-denied\",\n  \"invoiceAmount\": {\n    \"amount\": \"1.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{repayerToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Reservations-only token recording a repayment",
+          "description": "The invoice approver may reserve capacity, but not release it.",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"403 — recording a repayment needs repayments:write\", () => {",
+                  "  pm.response.to.have.status(403);",
+                  "  pm.expect(pm.response.json().code).to.eql(\"FORBIDDEN\");",
+                  "  pm.expect(pm.response.json().detail).to.include(\"repayments:write\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repaymentId\": \"repayment-denied\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations/{{usdInvoiceId}}/repayments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations",
+                "{{usdInvoiceId}}",
+                "repayments"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{approverToken}}",
                   "type": "string"
                 }
               ]
@@ -1452,19 +1574,377 @@
               ]
             }
           }
+        }
+      ]
+    },
+    {
+      "name": "6. Treasury updates",
+      "description": "Treasury owns the credit limit and the program's status, and sends updates over Kafka: a change as it happens, and periodic reconciliations that carry the full state again.",
+      "item": [
+        {
+          "name": "Treasury raises the limit",
+          "description": "Publishes a new limit of 12,000,000 USD for the program.",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Treasury's wire format. The sequence is the clock in milliseconds, so every message",
+                  "// this collection sends is newer than the one before it.",
+                  "const message = {",
+                  "  eventId: \"postman-\" + Date.now() + \"-\" + Math.random().toString(36).slice(2),",
+                  "  eventType: \"program.capacity.changed\",",
+                  "  occurredAt: new Date().toISOString(),",
+                  "  sequence: Date.now(),",
+                  "  program: {",
+                  "    id: pm.collectionVariables.get(\"programId\"),",
+                  "    creditLimit: { amount: \"12000000.00\", currency: \"USD\" },",
+                  "  },",
+                  "};",
+                  "pm.variables.set(\"treasuryMessage\", JSON.stringify(message));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — accepted by the broker\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  const [offset] = pm.response.json().offsets;",
+                  "  pm.expect(offset.error_code, \"Kafka error\").to.be.undefined;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/vnd.kafka.json.v2+json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"records\": [\n    { \"key\": \"{{programId}}\", \"value\": {{treasuryMessage}} }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{kafkaProxyUrl}}/topics/{{treasuryTopic}}",
+              "host": [
+                "{{kafkaProxyUrl}}"
+              ],
+              "path": [
+                "topics",
+                "{{treasuryTopic}}"
+              ]
+            }
+          }
         },
         {
-          "name": "Non-admin token opening a program",
+          "name": "Capacity reflects the new limit",
+          "description": "Waits for the feed, then checks that the new limit is available on top of what is reserved.",
           "event": [
             {
               "listen": "test",
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"403 — opening a program needs programs:admin\", () => {",
-                  "  pm.response.to.have.status(403);",
+                  "const attempts = Number(pm.collectionVariables.get(\"waitAttempts\") || 0);",
+                  "const body = pm.response.code === 200 ? pm.response.json() : null;",
+                  "const ready = body !== null && (body.creditLimit.amount === \"12000000.00\");",
+                  "",
+                  "if (!ready && attempts < 40) {",
+                  "  // Not consumed yet: ask again shortly.",
+                  "  pm.collectionVariables.set(\"waitAttempts\", attempts + 1);",
+                  "  setTimeout(() => {}, 500);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set(\"waitAttempts\", 0);",
+                  "  pm.test(\"the treasury feed applied the message\", () => {",
+                  "    pm.expect(ready, \"still not applied after 20 s — is the service consuming the feed (KAFKA_ENABLED=true)?\").to.be.true;",
+                  "  });",
+                  "  pm.test(\"200 — more available, the same amount reserved\", () => {",
+                  "    pm.expect(body.reservedAmount.amount).to.eql(\"250000.00\");",
+                  "    pm.expect(body.availableCapacity.amount).to.eql(\"11750000.00\");",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "capacity"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Treasury sends its periodic reconciliation",
+          "description": "A bulk reconciliation: the full state of what treasury owns, so both the limit (12,500,000 USD) and the status. It repairs anything an earlier message missed.",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Treasury's wire format. The sequence is the clock in milliseconds, so every message",
+                  "// this collection sends is newer than the one before it.",
+                  "const message = {",
+                  "  eventId: \"postman-\" + Date.now() + \"-\" + Math.random().toString(36).slice(2),",
+                  "  eventType: \"program.state.reconciled\",",
+                  "  occurredAt: new Date().toISOString(),",
+                  "  sequence: Date.now(),",
+                  "  program: {",
+                  "    id: pm.collectionVariables.get(\"programId\"),",
+                  "    creditLimit: { amount: \"12500000.00\", currency: \"USD\" },",
+                  "    status: \"ACTIVE\",",
+                  "  },",
+                  "};",
+                  "pm.variables.set(\"treasuryMessage\", JSON.stringify(message));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — accepted by the broker\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  const [offset] = pm.response.json().offsets;",
+                  "  pm.expect(offset.error_code, \"Kafka error\").to.be.undefined;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/vnd.kafka.json.v2+json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"records\": [\n    { \"key\": \"{{programId}}\", \"value\": {{treasuryMessage}} }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{kafkaProxyUrl}}/topics/{{treasuryTopic}}",
+              "host": [
+                "{{kafkaProxyUrl}}"
+              ],
+              "path": [
+                "topics",
+                "{{treasuryTopic}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Capacity reflects the reconciliation",
+          "description": "The limit is brought up to date; what is reserved is this service's own and does not change.",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const attempts = Number(pm.collectionVariables.get(\"waitAttempts\") || 0);",
+                  "const body = pm.response.code === 200 ? pm.response.json() : null;",
+                  "const ready = body !== null && (body.creditLimit.amount === \"12500000.00\");",
+                  "",
+                  "if (!ready && attempts < 40) {",
+                  "  // Not consumed yet: ask again shortly.",
+                  "  pm.collectionVariables.set(\"waitAttempts\", attempts + 1);",
+                  "  setTimeout(() => {}, 500);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set(\"waitAttempts\", 0);",
+                  "  pm.test(\"the treasury feed applied the message\", () => {",
+                  "    pm.expect(ready, \"still not applied after 20 s — is the service consuming the feed (KAFKA_ENABLED=true)?\").to.be.true;",
+                  "  });",
+                  "  pm.test(\"200 — the reconciled limit, the same reserved amount\", () => {",
+                  "    pm.expect(body.reservedAmount.amount).to.eql(\"250000.00\");",
+                  "    pm.expect(body.availableCapacity.amount).to.eql(\"12250000.00\");",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "capacity"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Treasury suspends the program",
+          "description": "A status change: status SUSPENDED only. The program stops taking new reservations; the limit is untouched.",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Treasury's wire format. The sequence is the clock in milliseconds, so every message",
+                  "// this collection sends is newer than the one before it.",
+                  "const message = {",
+                  "  eventId: \"postman-\" + Date.now() + \"-\" + Math.random().toString(36).slice(2),",
+                  "  eventType: \"program.status.changed\",",
+                  "  occurredAt: new Date().toISOString(),",
+                  "  sequence: Date.now(),",
+                  "  program: {",
+                  "    id: pm.collectionVariables.get(\"programId\"),",
+                  "    status: \"SUSPENDED\",",
+                  "  },",
+                  "};",
+                  "pm.variables.set(\"treasuryMessage\", JSON.stringify(message));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — accepted by the broker\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  const [offset] = pm.response.json().offsets;",
+                  "  pm.expect(offset.error_code, \"Kafka error\").to.be.undefined;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/vnd.kafka.json.v2+json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"records\": [\n    { \"key\": \"{{programId}}\", \"value\": {{treasuryMessage}} }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{kafkaProxyUrl}}/topics/{{treasuryTopic}}",
+              "host": [
+                "{{kafkaProxyUrl}}"
+              ],
+              "path": [
+                "topics",
+                "{{treasuryTopic}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Capacity shows the program suspended",
+          "description": "Waits for the feed to apply the suspension.",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const attempts = Number(pm.collectionVariables.get(\"waitAttempts\") || 0);",
+                  "const body = pm.response.code === 200 ? pm.response.json() : null;",
+                  "const ready = body !== null && (body.status === \"SUSPENDED\");",
+                  "",
+                  "if (!ready && attempts < 40) {",
+                  "  // Not consumed yet: ask again shortly.",
+                  "  pm.collectionVariables.set(\"waitAttempts\", attempts + 1);",
+                  "  setTimeout(() => {}, 500);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set(\"waitAttempts\", 0);",
+                  "  pm.test(\"the treasury feed applied the message\", () => {",
+                  "    pm.expect(ready, \"still not applied after 20 s — is the service consuming the feed (KAFKA_ENABLED=true)?\").to.be.true;",
+                  "  });",
+                  "  pm.test(\"200 — suspended, nothing else changed\", () => {",
+                  "    pm.expect(body.status).to.eql(\"SUSPENDED\");",
+                  "    pm.expect(body.reservedAmount.amount).to.eql(\"250000.00\");",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "capacity"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Reserve on a suspended program",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set(\"suspendedInvoiceId\", \"invoice-suspended-\" + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 — a suspended program takes no new reservations\", () => {",
+                  "  pm.response.to.have.status(409);",
                   "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
-                  "  pm.expect(pm.response.json().code).to.eql(\"FORBIDDEN\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"PROGRAM_NOT_ACTIVE\");",
                   "});"
                 ]
               }
@@ -1480,7 +1960,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"programId\": \"postman-should-not-exist\",\n  \"creditLimit\": {\n    \"amount\": \"1.00\",\n    \"currency\": \"USD\"\n  }\n}",
+              "raw": "{\n  \"invoiceId\": \"{{suspendedInvoiceId}}\",\n  \"invoiceAmount\": { \"amount\": \"1000.00\", \"currency\": \"USD\" }\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1488,22 +1968,127 @@
               }
             },
             "url": {
-              "raw": "{{baseUrl}}/programs",
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations",
               "host": [
                 "{{baseUrl}}"
               ],
               "path": [
-                "programs"
+                "programs",
+                "{{programId}}",
+                "reservations"
               ]
+            }
+          }
+        },
+        {
+          "name": "Treasury reactivates the program",
+          "description": "A status change: status ACTIVE only. New reservations are accepted again.",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Treasury's wire format. The sequence is the clock in milliseconds, so every message",
+                  "// this collection sends is newer than the one before it.",
+                  "const message = {",
+                  "  eventId: \"postman-\" + Date.now() + \"-\" + Math.random().toString(36).slice(2),",
+                  "  eventType: \"program.status.changed\",",
+                  "  occurredAt: new Date().toISOString(),",
+                  "  sequence: Date.now(),",
+                  "  program: {",
+                  "    id: pm.collectionVariables.get(\"programId\"),",
+                  "    status: \"ACTIVE\",",
+                  "  },",
+                  "};",
+                  "pm.variables.set(\"treasuryMessage\", JSON.stringify(message));"
+                ]
+              }
             },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 — accepted by the broker\", () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  const [offset] = pm.response.json().offsets;",
+                  "  pm.expect(offset.error_code, \"Kafka error\").to.be.undefined;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
             "auth": {
-              "type": "bearer",
-              "bearer": [
-                {
-                  "key": "token",
-                  "value": "{{writerToken}}",
-                  "type": "string"
-                }
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/vnd.kafka.json.v2+json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"records\": [\n    { \"key\": \"{{programId}}\", \"value\": {{treasuryMessage}} }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{kafkaProxyUrl}}/topics/{{treasuryTopic}}",
+              "host": [
+                "{{kafkaProxyUrl}}"
+              ],
+              "path": [
+                "topics",
+                "{{treasuryTopic}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Capacity shows the program active again",
+          "description": "Waits for the feed to apply the reactivation.",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const attempts = Number(pm.collectionVariables.get(\"waitAttempts\") || 0);",
+                  "const body = pm.response.code === 200 ? pm.response.json() : null;",
+                  "const ready = body !== null && (body.status === \"ACTIVE\");",
+                  "",
+                  "if (!ready && attempts < 40) {",
+                  "  // Not consumed yet: ask again shortly.",
+                  "  pm.collectionVariables.set(\"waitAttempts\", attempts + 1);",
+                  "  setTimeout(() => {}, 500);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set(\"waitAttempts\", 0);",
+                  "  pm.test(\"the treasury feed applied the message\", () => {",
+                  "    pm.expect(ready, \"still not applied after 20 s — is the service consuming the feed (KAFKA_ENABLED=true)?\").to.be.true;",
+                  "  });",
+                  "  pm.test(\"200 — active again\", () => {",
+                  "    pm.expect(body.status).to.eql(\"ACTIVE\");",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/capacity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "capacity"
               ]
             }
           }

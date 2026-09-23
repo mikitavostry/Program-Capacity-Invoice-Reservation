@@ -4,11 +4,11 @@ import { InvariantViolationError } from '../../../../../shared/domain/invariant-
 import { Currency } from '../../../../../shared/money/currency.js';
 import { Money } from '../../../../../shared/money/money.js';
 import {
-  CapacityDiscrepancyDetected,
   CapacityReleased,
   CapacityReserved,
   CreditLimitChanged,
   ProgramOpened,
+  ProgramStatusChanged,
 } from '../../../domain/events.js';
 import { ReservationId, type ProgramId, type RepaymentId } from '../../../domain/ids.js';
 import type { CapacityLedger, RecordedRepayment } from '../../../domain/ports/capacity-ledger.js';
@@ -52,13 +52,7 @@ export class PrismaCapacityLedger implements CapacityLedger {
   }
 }
 
-/**
- * Translates one domain event into the ledger rows it implies.
- *
- * An event the ledger does not recognise is an error, not something to skip. A new kind of
- * capacity change that silently left no trace would break the ledger's one promise — that
- * it explains every movement of the counter — and the drift check would only notice later.
- */
+/** The ledger rows for one event. An unknown event throws, so no movement goes unrecorded. */
 function toMovements(event: DomainEvent): MovementInput[] {
   if (event instanceof CapacityReserved) {
     return [
@@ -91,13 +85,11 @@ function toMovements(event: DomainEvent): MovementInput[] {
     ];
   }
 
-  // These change a program without moving reserved capacity: opening one sets its limit,
-  // treasury changes it later, and a discrepancy is an observation. The treasury events table
-  // audits the last two; the ledger stays exactly the movements of the counter.
+  // No reserved capacity moves; `treasury_events` audits these.
   if (
     event instanceof ProgramOpened ||
     event instanceof CreditLimitChanged ||
-    event instanceof CapacityDiscrepancyDetected
+    event instanceof ProgramStatusChanged
   ) {
     return [];
   }

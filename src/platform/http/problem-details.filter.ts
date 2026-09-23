@@ -10,10 +10,8 @@ import type { Request, Response } from 'express';
 import { DomainError } from '../../shared/domain/domain-error.js';
 import { RequestValidationError } from './request-validation.js';
 
-/** The HTTP status each error code maps to. Contexts contribute their own entries. */
 export type ErrorStatusTable = Readonly<Record<string, number>>;
 
-/** Codes raised by the shared kernel, whatever context raised them. */
 export const SHARED_ERROR_STATUSES: ErrorStatusTable = {
   INVALID_AMOUNT: HttpStatus.UNPROCESSABLE_ENTITY,
   CURRENCY_MISMATCH: HttpStatus.UNPROCESSABLE_ENTITY,
@@ -32,7 +30,6 @@ const HTTP_CODES: Readonly<Record<number, string>> = {
   415: 'UNSUPPORTED_MEDIA_TYPE',
 };
 
-/** Seconds a caller should wait before retrying a request refused as busy. */
 const BUSY_RETRY_AFTER_SECONDS = 1;
 
 export interface Problem {
@@ -43,11 +40,8 @@ export interface Problem {
 }
 
 /**
- * Renders every error as RFC 9457 problem details, with a stable `code` a client can branch on.
- *
- * Anything the table does not recognise is a 500 whose response says nothing about why: the
- * details go to the log, because an unexpected error's message is exactly the kind of internal
- * information a response should not carry.
+ * Renders every error as RFC 9457 problem details with a stable `code`. Anything unmapped is a
+ * 500 whose details go to the log, not the response.
  */
 @Catch()
 export class ProblemDetailsFilter implements ExceptionFilter {
@@ -77,7 +71,7 @@ export class ProblemDetailsFilter implements ExceptionFilter {
       if (status !== undefined) {
         return { status, code: error.code, detail: error.message, extensions: extensionsOf(error) };
       }
-      // An invariant violation, or a code nobody mapped: both are bugs, not caller errors.
+      // An invariant violation or an unmapped code: a bug, not the caller's error.
       return this.unexpected(error, request);
     }
 
@@ -111,7 +105,6 @@ export class ProblemDetailsFilter implements ExceptionFilter {
   }
 }
 
-/** Writes a problem as RFC 9457 `application/problem+json`, with the headers its status calls for. */
 export function sendProblem(response: Response, request: Request, problem: Problem): void {
   if (problem.status === HttpStatus.UNAUTHORIZED) {
     response.setHeader('WWW-Authenticate', 'Bearer realm="invoice-reservation"');
@@ -134,7 +127,7 @@ export function sendProblem(response: Response, request: Request, problem: Probl
     });
 }
 
-/** Structured detail some domain errors carry, surfaced so a client need not parse prose. */
+/** Amounts some domain errors carry, so a client need not parse `detail`. */
 function extensionsOf(error: DomainError): Record<string, unknown> | undefined {
   const fields: Record<string, unknown> = {};
   for (const key of ['requested', 'available', 'repayment', 'outstanding'] as const) {

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-/** The secret in `.env.example`. Fine for a laptop; refused outright in production. */
+/** The secret in `.env.example`; refused in production. */
 export const EXAMPLE_JWT_SECRET = 'local-development-secret-change-me-0123456789';
 
 export interface AppConfig {
@@ -15,7 +15,6 @@ export interface AppConfig {
     readonly maxWaitMs: number;
   };
   readonly auth: {
-    /** HMAC key for HS256 bearer tokens. */
     readonly secret: Uint8Array;
     readonly issuer: string;
     readonly audience: string;
@@ -26,23 +25,31 @@ export interface AppConfig {
     readonly rates: Readonly<Record<string, string>>;
   };
   readonly kafka: {
-    /** Off by default: the service runs, and serves HTTP, without a broker. */
+    /** Off by default, so the HTTP API runs without a broker. */
     readonly enabled: boolean;
     readonly brokers: readonly string[];
+    /** Verified against `caLocation` when given, else the system CAs. */
+    readonly ssl: { readonly enabled: boolean; readonly caLocation: string | undefined };
+    /** Required in production. */
+    readonly sasl: KafkaSasl | undefined;
     readonly clientId: string;
     readonly groupId: string;
     readonly treasuryTopic: string;
-    /** Where messages that can never succeed are parked, rather than blocking the feed. */
     readonly deadLetterTopic: string;
+    readonly capacityEventsTopic: string;
+    readonly outboxPollIntervalMs: number;
   };
+}
+
+export interface KafkaSasl {
+  readonly mechanism: 'plain' | 'scram-sha-256' | 'scram-sha-512';
+  readonly username: string;
+  readonly password: string;
 }
 
 export const APP_CONFIG = Symbol('AppConfig');
 
-/**
- * Rates used when `FX_RATES` is not set, outside production only, so the service runs locally
- * without extra setup. Illustrative figures, not market data.
- */
+/** Illustrative rates used outside production when `FX_RATES` is not set. */
 const DEVELOPMENT_FX_RATES = {
   asOf: '2026-09-19T00:00:00.000Z',
   rates: {
@@ -84,10 +91,17 @@ const envSchema = z
 
     KAFKA_ENABLED: z.enum(['true', 'false']).default('false'),
     KAFKA_BROKERS: z.string().default(''),
+    KAFKA_SSL: z.enum(['true', 'false']).default('false'),
+    KAFKA_SSL_CA_LOCATION: z.string().min(1).optional(),
+    KAFKA_SASL_MECHANISM: z.enum(['plain', 'scram-sha-256', 'scram-sha-512']).optional(),
+    KAFKA_SASL_USERNAME: z.string().min(1).optional(),
+    KAFKA_SASL_PASSWORD: z.string().min(1).optional(),
     KAFKA_CLIENT_ID: z.string().min(1).default('invoice-reservation'),
     KAFKA_GROUP_ID: z.string().min(1).default('invoice-reservation-capacity'),
     KAFKA_TREASURY_TOPIC: z.string().min(1).default('treasury.program-capacity'),
     KAFKA_DEAD_LETTER_TOPIC: z.string().min(1).default('treasury.program-capacity.dead-letter'),
+    KAFKA_CAPACITY_EVENTS_TOPIC: z.string().min(1).default('capacity.events'),
+    OUTBOX_POLL_INTERVAL_MS: integer(500, 50, 60_000),
   })
   .superRefine((env, ctx) => {
     if (env.KAFKA_ENABLED === 'true' && brokerList(env.KAFKA_BROKERS).length === 0) {
@@ -97,8 +111,35 @@ const envSchema = z
         message: 'is required when KAFKA_ENABLED is true',
       });
     }
+    if (env.KAFKA_SASL_MECHANISM !== undefined) {
+      for (const key of ['KAFKA_SASL_USERNAME', 'KAFKA_SASL_PASSWORD'] as const) {
+        if (env[key] === undefined) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [key],
+            message: 'is required with KAFKA_SASL_MECHANISM',
+          });
+        }
+      }
+    }
 
     if (env.NODE_ENV !== 'production') return;
+
+    // Anyone who can write to the treasury topic can change credit limits.
+    if (env.KAFKA_ENABLED === 'true' && env.KAFKA_SSL !== 'true') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['KAFKA_SSL'],
+        message: 'must be true in production; the brokers are not reached in plaintext',
+      });
+    }
+    if (env.KAFKA_ENABLED === 'true' && env.KAFKA_SASL_MECHANISM === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['KAFKA_SASL_MECHANISM'],
+        message: 'is required in production; the service authenticates to the brokers',
+      });
+    }
 
     if (env.JWT_SECRET === EXAMPLE_JWT_SECRET) {
       ctx.addIssue({
@@ -116,8 +157,7 @@ const envSchema = z
     }
   })
   .check((ctx) => {
-    // The lock wait must give up before the transaction ceiling, or a waiter would time out
-    // as a generic failure instead of a retryable "busy" (docs/architecture.md §6).
+    // Otherwise a lock waiter fails as a generic timeout instead of a retryable CAPACITY_BUSY.
     const env = ctx.value;
     if (env.DB_LOCK_TIMEOUT_MS >= env.DB_TRANSACTION_TIMEOUT_MS) {
       ctx.issues.push({
@@ -136,10 +176,6 @@ export class ConfigError extends Error {
   }
 }
 
-/**
- * Reads and validates configuration from the environment, reporting every problem at once
- * rather than failing on the first and making the operator fix them one restart at a time.
- */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = envSchema.safeParse(env);
   if (!parsed.success) {
@@ -171,10 +207,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     kafka: {
       enabled: values.KAFKA_ENABLED === 'true',
       brokers: brokerList(values.KAFKA_BROKERS),
+      ssl: { enabled: values.KAFKA_SSL === 'true', caLocation: values.KAFKA_SSL_CA_LOCATION },
+      sasl:
+        values.KAFKA_SASL_MECHANISM === undefined
+          ? undefined
+          : {
+              mechanism: values.KAFKA_SASL_MECHANISM,
+              // Guaranteed present with a mechanism by the refinement above.
+              username: values.KAFKA_SASL_USERNAME ?? '',
+              password: values.KAFKA_SASL_PASSWORD ?? '',
+            },
       clientId: values.KAFKA_CLIENT_ID,
       groupId: values.KAFKA_GROUP_ID,
       treasuryTopic: values.KAFKA_TREASURY_TOPIC,
       deadLetterTopic: values.KAFKA_DEAD_LETTER_TOPIC,
+      capacityEventsTopic: values.KAFKA_CAPACITY_EVENTS_TOPIC,
+      outboxPollIntervalMs: values.OUTBOX_POLL_INTERVAL_MS,
     },
   };
 }

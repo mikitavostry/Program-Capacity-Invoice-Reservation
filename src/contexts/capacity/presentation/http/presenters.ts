@@ -6,10 +6,7 @@ import type {
   ReservationView,
 } from '../../application/views.js';
 
-/*
- * The response contract, written out rather than left to whatever `JSON.stringify` makes of a
- * view. Renaming a field inside the application must not silently change what clients receive.
- */
+/* The response contract, spelled out so an internal rename cannot change what clients get. */
 
 export interface MoneyJson {
   readonly amount: string;

@@ -28,12 +28,7 @@ export class ProgramAlreadyExistsError extends DomainError {
   }
 }
 
-/**
- * A treasury message no newer than the state already applied.
- *
- * Kafka redelivers and can reorder, so this is expected traffic rather than a fault: the
- * message is recorded and ignored.
- */
+/** A treasury message not newer than what is applied: expected under redelivery, recorded and ignored. */
 export class StaleTreasuryUpdateError extends DomainError {
   readonly code = 'TREASURY_UPDATE_STALE';
   readonly applied: number;
@@ -45,6 +40,16 @@ export class StaleTreasuryUpdateError extends DomainError {
     );
     this.applied = applied;
     this.received = received;
+  }
+}
+
+export class TreasuryCurrencyMismatchError extends DomainError {
+  readonly code = 'TREASURY_CURRENCY_MISMATCH';
+
+  constructor(programId: ProgramId, reported: Currency, programCurrency: Currency) {
+    super(
+      `Treasury reports a credit limit in ${reported.code} for program ${programId.value}, which is in ${programCurrency.code}.`,
+    );
   }
 }
 
@@ -100,7 +105,6 @@ export class ReservationProgramMismatchError extends DomainError {
   }
 }
 
-/** An invoice amount could not be brought into the program's currency with what was supplied. */
 export class ExchangeRateUnusableError extends DomainError {
   readonly code = 'CURRENCY_NOT_CONVERTIBLE';
 

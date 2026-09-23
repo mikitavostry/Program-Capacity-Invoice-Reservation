@@ -3,7 +3,7 @@
 // Amounts are stored as BIGINT minor units beside a currency code: a single NUMERIC(p, 2)
 // column cannot hold currencies that subdivide into zero or three places. Invariants that
 // the schema language cannot express — CHECK constraints and the ledger's append-only
-// trigger — are added by hand in the migrations. See docs/architecture.md §11.
+// trigger — are added by hand in the migrations. See docs/architecture.md §3.6.
 
 generator client {
   provider               = "prisma-client"
@@ -89,6 +89,27 @@ model TreasuryEvent {
   @@map("treasury_events")
 }
 
+/// Events waiting to be published to other services (the transactional outbox). Written in the
+/// same transaction as the change they describe; the relay publishes them in `position` order
+/// and marks each one published.
+model OutboxEvent {
+  /// The published message's `eventId`; consumers use it to drop redeliveries.
+  id          String    @id @db.Uuid
+  /// Insertion order, including between events written in the same transaction.
+  position    BigInt    @unique @default(autoincrement())
+  programId   String    @map("program_id")
+  eventType   String    @map("event_type")
+  /// The message exactly as it will be published.
+  payload     Json
+  occurredAt  DateTime  @map("occurred_at") @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(3)
+
+  /// What the relay reads: the unpublished events, oldest first.
+  @@index([position], map: "outbox_events_unpublished", where: raw("published_at IS NULL"))
+  @@map("outbox_events")
+}
+
 /// One hold against a program, and the repayments that wind it down.
 model Reservation {
   id               String            @id
@@ -108,7 +129,7 @@ model Reservation {
   reservedAt       DateTime          @map("reserved_at") @db.Timestamptz(3)
   releasedAt       DateTime?         @map("released_at") @db.Timestamptz(3)
 
-  program   Program            @relation(fields: [programId, reservedCurrency], references: [id, currency])
+  program   Program            @relation(fields: [programId, reservedCurrency], references: [id, currency], onUpdate: Restrict)
   movements CapacityMovement[]
 
   /// An invoice may hold at most one live reservation against a program.
@@ -135,7 +156,7 @@ model CapacityMovement {
   occurredAt          DateTime     @map("occurred_at") @db.Timestamptz(3)
   recordedAt          DateTime     @default(now()) @map("recorded_at") @db.Timestamptz(3)
 
-  program     Program     @relation(fields: [programId, currency], references: [id, currency])
+  program     Program     @relation(fields: [programId, currency], references: [id, currency], onUpdate: Restrict)
   reservation Reservation @relation(fields: [reservationId], references: [id])
 
   /// Repayment idempotency: a repayment id is applied at most once per program.

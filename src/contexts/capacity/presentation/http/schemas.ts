@@ -1,28 +1,22 @@
 import { z } from 'zod';
 import { Currency } from '../../../../shared/money/currency.js';
-import { Money } from '../../../../shared/money/money.js';
+import { MAX_MINOR_UNITS, Money } from '../../../../shared/money/money.js';
 import { RESERVATION_STATUSES } from '../../domain/reservation.js';
 import { MAX_PAGE_SIZE } from '../../application/list-reservations/list-reservations.query.js';
 
 /*
- * Request shapes, parsed straight into domain values: a request that gets past these schemas
- * already holds `Money`, never a string that some later layer might forget to check.
- *
- * Objects are `.strict()`. In a money API a misspelt field — `ammount` — that is silently
- * ignored is far worse than one that is refused.
+ * Request schemas, parsed straight into domain values such as `Money`. Objects are strict: a
+ * misspelt field is refused rather than silently ignored.
  */
 
-/** Ids appear in URLs, so they are kept to characters that need no escaping. */
+/** Ids appear in URLs, so only characters that need no escaping. */
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 export const identifier = z
   .string({ error: 'must be a string' })
   .regex(ID_PATTERN, "must be 1–128 characters of letters, digits, '.', '_', ':' or '-'");
 
-/**
- * `{ "amount": "1234.56", "currency": "USD" }`. The amount must be a string: a JSON number has
- * already been through a binary float by the time it arrives, and may not be the number sent.
- */
+/** `{ "amount": "1234.56", "currency": "USD" }`; a JSON number is refused, having been a float. */
 export const money = z
   .object({
     amount: z.string({ error: 'must be a decimal string such as "1234.56", not a number' }),
@@ -38,22 +32,28 @@ export const money = z
       return z.NEVER;
     }
 
+    let amount: Money;
     try {
-      return Money.fromDecimal(value.amount, currency);
+      amount = Money.fromDecimal(value.amount, currency);
     } catch (error) {
       ctx.addIssue({ code: 'custom', path: ['amount'], message: (error as Error).message });
       return z.NEVER;
     }
+    if (amount.minorUnits > MAX_MINOR_UNITS || -amount.minorUnits > MAX_MINOR_UNITS) {
+      ctx.addIssue({ code: 'custom', path: ['amount'], message: 'is too large' });
+      return z.NEVER;
+    }
+    return amount;
   });
 
-export const openProgramBody = z.object({ programId: identifier, creditLimit: money }).strict();
-
-export const reserveCapacityBody = z.object({ invoiceId: identifier, amount: money }).strict();
+export const reserveCapacityBody = z
+  .object({ invoiceId: identifier, invoiceAmount: money })
+  .strict();
 
 export const recordRepaymentBody = z
   .object({
     repaymentId: identifier,
-    /** Omit (or send null) to repay whatever is outstanding. */
+    /** Omitted or null: repay whatever is outstanding. */
     amount: money.nullish(),
   })
   .strict();

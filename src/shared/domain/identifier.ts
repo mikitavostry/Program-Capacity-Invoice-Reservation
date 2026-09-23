@@ -9,14 +9,6 @@ export class InvalidIdentifierError extends DomainError {
   }
 }
 
-/**
- * Base class for typed identifiers.
- *
- * Identifiers compare by exact type as well as by value, so a `ProgramId` and an
- * `InvoiceId` holding the same string are never equal. That distinction earns its keep:
- * these ids travel side by side through most of the domain, and as bare strings they could
- * be swapped at a call site without anything complaining.
- */
 export abstract class Identifier extends ValueObject {
   readonly value: string;
 

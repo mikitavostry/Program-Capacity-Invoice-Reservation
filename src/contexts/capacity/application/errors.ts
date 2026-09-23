@@ -21,13 +21,7 @@ export class ReservationNotFoundError extends DomainError {
   }
 }
 
-/**
- * A reservation request for an invoice that already holds one, for a different amount.
- *
- * The same amount is treated as a retry and answered with the existing reservation. A
- * different one cannot be a retry — it is either a mistake or a change the caller should
- * make explicitly — so it is refused rather than guessed at.
- */
+/** The invoice already holds a reservation for a different amount, so this is not a retry. */
 export class InvoiceAlreadyReservedError extends DomainError {
   readonly code = 'INVOICE_ALREADY_RESERVED';
 
@@ -38,13 +32,7 @@ export class InvoiceAlreadyReservedError extends DomainError {
   }
 }
 
-/**
- * A repayment id that was already applied, sent again with a different invoice or amount.
- *
- * An exact replay is answered with the original outcome. A mismatched one means the caller
- * reused an id it should not have, and silently applying — or silently ignoring — the new
- * amount would each lose money somewhere.
- */
+/** A repayment id already applied, sent again with a different invoice or amount. */
 export class RepaymentIdReusedError extends DomainError {
   readonly code = 'REPAYMENT_ID_REUSED';
 

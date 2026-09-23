@@ -1,12 +1,19 @@
 /**
- * Publishes a treasury message to the local feed, to exercise it by hand.
+ * Plays the treasury system: publishes one message to the local feed.
  *
- *   npm run treasury -- --program program-1 --limit 2500000.00 --sequence 1
- *   npm run treasury -- --program program-1 --limit 2500000.00 --sequence 2 --reserved 125000.00
+ *   npm run treasury -- --program program-1 --limit 10000000.00 --currency USD   # opens it
+ *   npm run treasury -- --program program-1 --limit 2500000.00                    # new limit
+ *   npm run treasury -- --program program-1 --status SUSPENDED                    # new status
+ *   npm run treasury -- --program program-1 --limit 2500000.00 --status ACTIVE --reconcile
  *   npm run treasury -- --program program-1 --malformed
  *
- * `--reserved` sends a bulk reconciliation instead of a capacity change. `--malformed` sends
- * something the schema rejects, to watch it land in the dead-letter topic.
+ * `--limit` alone sends a capacity change, `--status` alone a status change, and both with
+ * `--reconcile` a periodic reconciliation (the full state). The first message with a limit for a
+ * program id opens that program; later ones update it. `--malformed` sends something the schema
+ * rejects, to watch it land in the dead-letter topic.
+ *
+ * `--sequence` defaults to the current time in seconds, so successive runs are always newer.
+ * `--event-id` fixes the message id, so publishing the same message again is a duplicate.
  */
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -23,50 +30,57 @@ if (process.env['NODE_ENV'] === 'production') {
 const { values } = parseArgs({
   options: {
     program: { type: 'string', default: 'program-1' },
-    limit: { type: 'string', default: '2500000.00' },
+    limit: { type: 'string' },
     currency: { type: 'string', default: 'USD' },
     sequence: { type: 'string' },
-    reserved: { type: 'string' },
+    reconcile: { type: 'boolean', default: false },
+    status: { type: 'string' },
+    'event-id': { type: 'string' },
     malformed: { type: 'boolean', default: false },
   },
 });
 
+const eventType = values.reconcile
+  ? 'program.state.reconciled'
+  : values.status !== undefined
+    ? 'program.status.changed'
+    : 'program.capacity.changed';
+
+if (!values.malformed) {
+  if (values.reconcile && (values.limit === undefined || values.status === undefined)) {
+    fail('A reconciliation carries the full state: give both --limit and --status.');
+  }
+  if (!values.reconcile && values.limit !== undefined && values.status !== undefined) {
+    fail('Send --limit and --status separately, or together with --reconcile.');
+  }
+  if (!values.reconcile && values.limit === undefined && values.status === undefined) {
+    fail('Give --limit (a capacity change) or --status (a status change).');
+  }
+}
+
+function fail(message: string): never {
+  console.error(message);
+  process.exit(1);
+}
+
 const brokers = (process.env['KAFKA_BROKERS'] ?? 'localhost:19092').split(',');
 const topic = process.env['KAFKA_TREASURY_TOPIC'] ?? 'treasury.program-capacity';
-const deadLetterTopic =
-  process.env['KAFKA_DEAD_LETTER_TOPIC'] ?? 'treasury.program-capacity.dead-letter';
 
 const kafka = new KafkaJS.Kafka({
   kafkaJS: { brokers, clientId: 'treasury-publisher', logLevel: KafkaJS.logLevel.NOTHING },
 });
 
-// Created here so a first local run does not need the topics to exist already.
-const admin = kafka.admin();
-await admin.connect();
-await admin
-  .createTopics({
-    topics: [
-      { topic, numPartitions: 1 },
-      { topic: deadLetterTopic, numPartitions: 1 },
-    ],
-  })
-  .catch(() => undefined);
-await admin.disconnect();
-
-const program: Record<string, unknown> = {
-  id: values.program,
-  creditLimit: { amount: values.limit, currency: values.currency },
-};
-if (values.reserved !== undefined) {
-  program['reservedAmount'] = { amount: values.reserved, currency: values.currency };
+const program: Record<string, unknown> = { id: values.program };
+if (values.limit !== undefined) {
+  program['creditLimit'] = { amount: values.limit, currency: values.currency };
 }
+if (values.status !== undefined) program['status'] = values.status;
 
 const message = values.malformed
   ? '{ "eventId": "malformed", not really json'
   : JSON.stringify({
-      eventId: `treasury-${randomUUID()}`,
-      eventType:
-        values.reserved === undefined ? 'program.capacity.changed' : 'program.state.reconciled',
+      eventId: values['event-id'] ?? `treasury-${randomUUID()}`,
+      eventType,
       occurredAt: new Date().toISOString(),
       sequence: Number(values.sequence ?? Math.floor(Date.now() / 1000)),
       program,

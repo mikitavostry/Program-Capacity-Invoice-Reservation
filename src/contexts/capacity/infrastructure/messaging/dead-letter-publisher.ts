@@ -4,12 +4,6 @@ import type {
   KafkaProducer,
 } from '../../../../platform/kafka/kafka-client.js';
 
-/**
- * Parks a message that can never succeed, with why and where it came from.
- *
- * The original bytes are republished untouched: whoever investigates needs what treasury
- * actually sent, not this service's reading of it.
- */
 export class DeadLetterPublisher {
   private readonly logger = new Logger(DeadLetterPublisher.name);
 

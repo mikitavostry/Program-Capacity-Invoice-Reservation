@@ -1,669 +1,597 @@
 # Architecture
 
-Domain-driven design for the Program Capacity & Invoice Reservation service.
+## 1. Purpose
 
-This document records the structure and the reasoning behind it. Where a choice had a real
-alternative, the alternative and the trade-off are stated rather than implied.
+A financing program lends against invoices up to a fixed **credit limit** (for example
+$10,000,000). When an invoice is approved for early payment, part of that limit is taken by it;
+when the invoice is repaid, that part becomes available again.
 
-## 1. Context and scope
+This service keeps track of that in real time. For every program it knows the credit limit, how
+much is currently reserved by invoices, and how much is still available — and it is the place
+where reservations and repayments are recorded, so availability can never be exceeded.
 
-One bounded context is implemented: **Program Capacity**.
+It works alongside two other systems that it does not own:
 
-Two contexts are upstream and not owned here:
+- **Invoicing** — decides which invoices are approved and when they are repaid, and tells this
+  service. The service stores only an invoice's id, amount and currency.
+- **Treasury** — where programs are defined, and the system of record for each program's credit
+  limit and status. It publishes programs, limit and status changes, and periodic
+  reconciliation messages over Kafka.
 
-- **Invoicing** — we hold an `InvoiceId`, the invoice's amount and currency, and references
-  to its repayments. We never model an Invoice. Whether it is approved, disputed or overdue
-  is not our concern; we are told to reserve against it and told when it is repaid.
-- **Treasury** — the system of record for how much credit a program has. It publishes
-  capacity changes and bulk reconciliation over Kafka; we consume them (§13). It owns the
-  credit limit; we own what is reserved against it.
+### 1.1 Assumptions
 
-## 2. The dependency rule
+The brief leaves these open; this is how the service reads them.
+
+- **Programs come from treasury.** The brief does not say where programs are created. Treasury is
+  taken to be where they are defined: its first Kafka message for a program id opens the program,
+  and there is no HTTP endpoint for creating one.
+- **Each system sends only what it owns.** Treasury owns the limit and status, so its messages
+  and reconciliations (`program.state.reconciled`) carry only those. This service owns the
+  reserved amount; treasury never sends one, since it tracks money paid out, not reservations.
+- **"Bulk" reconciliation is one message per program.** A reconciliation run is a burst of
+  `program.state.reconciled` messages, one per program, rather than one message listing many
+  programs. Each keeps its own sequence, deduplication and dead-lettering, so one bad entry
+  cannot hold back or discard the rest.
+- **The invoice decides the amount.** A reservation holds the invoice's full amount
+  (`invoiceAmount`), in the invoice's currency, sent by the system that approved the invoice.
+  The service does not own invoices and cannot verify the amount; it fixes it on the first
+  reservation (a different amount for the same invoice is refused) and caps repayments by it.
+- **JSON messages without a schema registry.** Messages are JSON, validated with zod on the way
+  in (`treasury-message.ts`) and built in one module on the way out (`capacity-events.ts`). With
+  more teams sharing these contracts, Avro or Protobuf with a schema registry could be used.
+- **Exchange rates come from a static table.** The brief names no rate source, so rates are
+  read from configuration (`FX_RATES`) as a stand-in for a live rate service (§4).
+- **Partial repayments** are an addition to the brief: invoices can be repaid in instalments,
+  each identified by a caller-supplied `repaymentId`.
+
+## 2. Functionality
+
+### 2.1 Programs
+
+- Programs come only from treasury. The first treasury message for a program id opens the
+  program, with the id, credit limit and currency the message carries.
+- Its current state can be read over HTTP at any time: credit limit, reserved amount, available
+  capacity (`creditLimit − reserved`) and status.
+- A program is `ACTIVE` or `SUSPENDED`, as treasury says. Only an active program accepts new
+  reservations; repayments are accepted in either status. A program starts `ACTIVE` unless its
+  first treasury message says otherwise.
+
+### 2.2 Reservations
+
+- Reserving capacity for an invoice creates a **reservation** that holds the invoice's full
+  amount against the program's limit. It is refused if that is more than what is available.
+- The amount comes from the system that approved the invoice (`invoiceAmount`, in the invoice's
+  currency). The service does not own invoices and cannot verify it; it fixes the amount on the
+  first reservation and caps repayments by it.
+- An invoice has at most one active reservation per program.
+- Reservations for a program can be listed, filtered by status and paged with a cursor.
+
+### 2.3 Repayments
+
+- A repayment against an invoice releases capacity back to the program.
+- Repayments can be **partial**: an invoice can be repaid in several instalments, each
+  releasing its share. A repayment with no amount repays everything still outstanding.
+- A repayment may not exceed what is outstanding. When an invoice is fully repaid, its
+  reservation becomes `RELEASED` and everything it held is available again.
+- Released reservations are kept as history.
+
+### 2.4 Multiple currencies
+
+- A program has one currency; invoices can be in another.
+- An invoice in another currency is converted into the program's currency when it is reserved,
+  and the exchange rate used is stored with the reservation. Every repayment for that invoice is
+  converted with the same stored rate.
+- Rounding: reserving rounds up; partial releases round down on the running total; the final
+  repayment releases exactly what is left, so total released equals total reserved.
+
+### 2.5 Treasury updates and over limit
+
+- Treasury messages open a program (the first message with a limit for its id) and then change
+  its credit limit or its status: a capacity change carries only the limit, a status change only
+  the status. A status change for a program that has never been opened is dead-lettered.
+- Treasury may lower a limit below what is already reserved. The new limit is applied and the
+  program is **over limit**: available capacity is negative, new reservations are refused, and
+  repayments bring it back under. Existing reservations are not affected.
+- Periodic reconciliation messages carry the program's full state again — limit and status —
+  so anything an earlier message missed is brought up to date.
+- The reserved amount is this service's alone: reservations are made here, and treasury never
+  sees them or sends a figure for them.
+
+### 2.6 Safe retries
+
+Every write can be retried without being applied twice:
+
+| Operation | Repeat with the same data | Repeat with different data |
+| --- | --- | --- |
+| Reserve (same program + invoice, while active) | returns the existing reservation (`200`) | `INVOICE_ALREADY_RESERVED` |
+| Repay (same `repaymentId`) | returns the original result (`replayed: true`) | `REPAYMENT_ID_REUSED` |
+| Treasury message (same `eventId`) | applied once | — |
+
+A reserve request repeated after the invoice has been fully repaid creates a new reservation.
+
+### 2.7 History
+
+Every change to a program's reserved amount is written to an append-only ledger, and every
+treasury message is stored with its outcome and raw payload. Neither is ever updated or deleted.
+
+### 2.8 Events for other services
+
+Every change — a program opened, capacity reserved or released, a limit or status changed — is
+published to Kafka (`capacity.events`) for other services, through a transactional outbox: an
+event is published if and only if its change committed (§3.11).
+
+## 3. Main parts
+
+### 3.1 Layers and folders
 
 ```
 presentation (HTTP) ─┐
                      ├──► application ──► domain
-infrastructure ──────┘                      ▲
-   (Prisma, FX)      │                      │
-                     └── adapters implement ports the domain declares
+infrastructure ──────┘         ▲              ▲
+ (Prisma, Kafka, FX) └─────────┴──────────────┴── implements ports declared by these two
 ```
-
-The domain layer imports nothing: no NestJS, no Prisma, no decorators. This is not purity
-for its own sake — it is what lets the capacity invariant be tested exhaustively in
-milliseconds without a database or a DI container, and it is what stops persistence
-concerns from quietly becoming business rules.
-
-Ports are declared in `domain/ports` as plain TypeScript interfaces alongside a `Symbol`
-injection token, because interfaces do not exist at runtime and Nest needs something
-concrete to bind against. Adapters live in `infrastructure` and are wired in the module.
-
-## 3. Structure
 
 ```
 src/
+├─ main.ts, app.module.ts   bootstrap and root module
+├─ api-docs.ts              OpenAPI document (§3.9)
 ├─ shared/
-│  ├─ domain/              aggregate-root, entity, value-object, identifier,
-│  │                       domain-event, domain-error, invariant-violation-error
-│  └─ money/               shared kernel: Money, Currency, ExchangeRate, rounding
-├─ contexts/
-│  └─ capacity/
-│     ├─ domain/
-│     │  ├─ program.ts            aggregate root — owns the capacity invariant
-│     │  ├─ reservation.ts        aggregate root — one hold and its repayments
-│     │  ├─ ids.ts                ProgramId, ReservationId, InvoiceId, RepaymentId
-│     │  ├─ events.ts             ProgramOpened, CapacityReserved, CapacityReleased,
-│     │  │                        CreditLimitChanged, CapacityDiscrepancyDetected
-│     │  ├─ errors.ts             InsufficientCapacity, RepaymentExceedsOutstanding, ...
-│     │  └─ ports/                ProgramRepository, ReservationRepository, CapacityLedger,
-│     │                           TreasuryEventLog, ExchangeRateProvider, TransactionRunner
-│     ├─ application/
-│     │  ├─ reserve-capacity/     command + handler
-│     │  ├─ record-repayment/     command + handler
-│     │  ├─ open-program/         command + handler
-│     │  ├─ get-program-capacity/ query + handler
-│     │  ├─ list-reservations/    query + handler, keyset cursor
-│     │  ├─ apply-treasury-update/ command + handler (the feed's only way in)
-│     │  ├─ ports/                CapacityReadModel (the unlocked query side)
-│     │  ├─ views.ts              what handlers return — never aggregates
-│     │  └─ errors.ts             not-found and idempotency conflicts
-│     ├─ infrastructure/
-│     │  ├─ persistence/prisma/   repositories, mappers, ledger, read model, transaction runner
-│     │  ├─ messaging/            treasury ACL, consumer, dead letters, feed lifecycle
-│     │  └─ fx/                   static rate provider (stand-in for a real FX service)
-│     ├─ presentation/http/       controllers, zod schemas, presenters, error statuses
-│     └─ capacity.module.ts
-├─ iam/                    token verifier, authentication + authorization guards, @Public
-├─ platform/               config, Prisma + Kafka clients, problem-details filter, health
-├─ app.module.ts
-└─ main.ts
+│  ├─ domain/        base classes: AggregateRoot, Entity, ValueObject, Identifier,
+│  │                 DomainEvent, DomainError, InvariantViolationError
+│  ├─ money/         Money, Currency, ExchangeRate, decimal parsing, rounding
+│  └─ application/   Clock
+├─ contexts/capacity/
+│  ├─ domain/          Program, Reservation, ids, events, errors, ports/
+│  ├─ application/     one folder per command/query + handler; views; errors; ports/ (read model)
+│  ├─ infrastructure/  persistence/prisma, messaging (treasury feed, outbox relay,
+│  │                   dead letters, event contract), fx
+│  ├─ presentation/    http: controllers, request and response schemas, presenters,
+│  │                   error statuses
+│  └─ capacity.module.ts
+├─ iam/              JWT verification, authentication + authorization guards
+├─ platform/         config, Prisma and Kafka clients, HTTP setup (problem details, request
+│                    logging and validation), health
+└─ generated/prisma  Prisma client (gitignored; generated by `prisma generate` on install)
 ```
 
-`contexts/` rather than `modules/` is deliberate: it names bounded contexts, so a second
-context later sits beside the first instead of dissolving into an undifferentiated pile of
-feature folders.
+Unit and integration specs sit next to the code in `test/` folders; the top-level `test/` holds
+the e2e suite and shared test setup.
 
-## 4. Domain model
+- **domain** — business objects and rules. No framework or database imports.
+- **application** — command and query handlers (`@nestjs/cqrs`), and the views they return.
+- **infrastructure** — Prisma repositories and read model, the Kafka consumer, the outbox relay,
+  the FX rate provider.
+- **presentation** — HTTP controllers, request and response schemas, presenters.
 
-### 4.1 Program — aggregate root
+Ports are TypeScript interfaces in `domain/ports` (and, for the read model,
+`application/ports`), each with a `Symbol` injection token, bound to their implementations in
+`capacity.module.ts`.
 
-```ts
-class Program extends AggregateRoot<ProgramId> {
-  #creditLimit: Money;      // treasury owns this
-  #reservedAmount: Money;   // denormalised counter; we own this
-  #status: ProgramStatus;   // ACTIVE | SUSPENDED
-  #treasurySequence: number;
-  readonly version: number;
+### 3.2 Domain model
 
-  get availableCapacity(): Money;                              // creditLimit − reservedAmount
-  get isOverLimit(): boolean;
-  reserveFor(request: ReserveCapacity): Reservation;
-  release(reservation: Reservation, repayment: ApplyRepayment): Money;
-  applyTreasuryState(state: TreasuryState): void;
-}
-```
+**`Program`** — `creditLimit`, `reservedAmount` (running total of active holds), `status`,
+`treasurySequence`, `version`. Methods: `openFromTreasury`, `reserveFor`, `release`,
+`applyTreasuryState`.
 
-Invariants enforced inside the root:
+**`Reservation`** — one hold for one invoice: invoice amount (invoice currency), reserved amount
+(program currency), rate snapshot, repaid and released amounts, status (`ACTIVE → RELEASED`),
+timestamps. Method: `recordRepayment`.
 
-- nothing this service does takes `reservedAmount` above `creditLimit` or below zero
-- every `Money` the program holds is denominated in the program's own currency
-- a program must be `ACTIVE` to accept new reservations
-- repayments are accepted whatever the status: capacity that has been repaid must be freed,
-  even on a suspended program
-- treasury state is applied only in increasing sequence order (§13.2)
+`Program` and `Reservation` refer to each other by id. `program.reserveFor(...)` creates each
+reservation, and `program.release(reservation, …)` applies each repayment, updating the
+reservation and the program's counter together; both are saved in one transaction.
+`reservedAmount` always equals the sum held by active reservations and the sum of ledger
+movements (§3.5).
 
-`reservedAmount` can exceed `creditLimit`, but only because treasury lowered the limit under
-existing holds — see §4.5.
+**`Money`** — an integer amount in minor units (`bigint`) with a currency; arithmetic across
+currencies is rejected. Ids (`ProgramId`, `ReservationId`, `InvoiceId`, `RepaymentId`) are
+separate value classes.
 
-### 4.2 Two aggregates, not one
+**Domain events** — `ProgramOpened`, `CapacityReserved`, `CapacityReleased`,
+`CreditLimitChanged`, `ProgramStatusChanged`. Aggregates record them with `raise()`.
 
-`Program` and `Reservation` are **both** aggregate roots, referencing each other by identity
-only. A `Reservation` holds a `ProgramId`, never a `Program` object.
+### 3.3 Use cases
 
-The boundary test is: what has to be loaded together in order to check an invariant?
-Enforcing `reservedAmount ≤ creditLimit` reads exactly one field on the program. It never
-reads a reservation row. So reservations are not required to enforce the capacity invariant,
-and putting them inside the boundary that protects it buys nothing.
-
-The alternative — `Reservation` as a child entity of the `Program` aggregate — does not
-survive contact with the implementation. A program may hold tens of thousands of
-reservations, so the root cannot own them as a collection; each one is retrieved by its own
-identity, modified on its own, and persisted through its own repository. An entity that is
-loaded independently and modified independently is a root. Calling it a child would describe
-the diagram rather than the code.
-
-`Reservation` also guards invariants of its own (§4.3), which is the other half of what
-makes something a root.
-
-**What keeps the two in step.** `program.reserveFor(...)` returns the new `Reservation` —
-one aggregate acting as a factory for another, the same shape as `Forum.startDiscussion()`
-returning a `Discussion` — and `program.release(reservation, repayment)` is the only path
-that applies a repayment. Moving the counter and changing the reservation therefore cannot
-be done separately from inside the domain.
-
-**Trade-off.** Both roots are written in a single transaction, which is a deliberate
-exception to the "modify one aggregate per transaction" guideline. That guideline exists to
-protect scalability; taking it literally here would mean eventual consistency on a credit
-limit, i.e. transiently oversubscribing real money. Correctness wins, and the exception is
-confined to two command handlers.
-
-**The redundancy is checkable.** `Program.reservedAmount` is openly a denormalisation, and
-it can be recomputed two independent ways — from the reservations and from the ledger (§8):
-
-```sql
-SELECT SUM(reserved_minor - released_minor) FROM reservations
- WHERE program_id = $1 AND status = 'ACTIVE';            -- must equal programs.reserved_minor
-
-SELECT SUM(CASE type WHEN 'RESERVE' THEN amount_minor ELSE -amount_minor END)
-  FROM capacity_movements WHERE program_id = $1;         -- and so must this
-```
-
-Any divergence is a bug, which makes this a drift detector rather than a hidden assumption.
-
-### 4.3 Reservation — aggregate root
-
-The record of one hold against a program, and of the repayments that wind it down.
-
-| Field | Purpose |
-| --- | --- |
-| `invoiceId` | the invoice this hold belongs to |
-| `invoiceAmount` | the invoice's amount, in the invoice's currency |
-| `reservedAmount` | the capacity held when the reservation was made, in program currency |
-| `exchangeRate` | the rate snapshot, with its observation time; `null` if no conversion |
-| `repaidAmount` | repaid so far, in invoice currency |
-| `releasedAmount` | capacity freed so far, in program currency |
-| `status` | `ACTIVE` while anything is outstanding, `RELEASED` once fully repaid |
-| `reservedAt` / `releasedAt` | when it was made, and when the final repayment arrived |
-
-Derived: `outstandingAmount = invoiceAmount − repaidAmount` and
-`heldAmount = reservedAmount − releasedAmount`.
-
-Invariants enforced inside this root:
-
-- `0 ≤ repaidAmount ≤ invoiceAmount` and `0 ≤ releasedAmount ≤ reservedAmount`
-- repayments are in the invoice's currency; a repayment larger than what is outstanding is
-  refused rather than capped
-- `RELEASED` exactly when fully repaid, and a fully repaid reservation has released
-  **everything** it reserved — not a minor unit less
-- the rate snapshot is immutable; nothing re-prices an existing hold
-- without a rate, what was released always equals what was repaid
-
-A released reservation is never deleted. The audit trail is a product requirement here, not
-a debugging convenience.
-
-### 4.4 Partial repayments
-
-Invoices may be repaid in instalments, and each instalment frees its share of the hold.
-
-A repayment is stated in the **invoice's** currency — "invoice X was repaid €40" is what the
-invoicing context knows. For a converted reservation that raises the question of how much
-program-currency capacity €40 frees. Two rules answer it:
-
-1. **Compute from the running total, never per instalment.** The capacity freed so far is
-   derived from the *cumulative* amount repaid, and each instalment frees the difference
-   between the new total and the old one. Rounding therefore happens once, on the total,
-   instead of accumulating an error per instalment.
-2. **Round partial releases down; the final repayment settles exactly.** Until the invoice
-   is fully repaid, capacity freed is `floor(repaid × rate)`, so an instalment can never
-   free more than its share. The repayment that clears the invoice frees whatever is still
-   held, so the total released equals the total reserved to the minor unit, however the
-   repayments were split.
-
-Worked example — €0.03 at 1.095 is $0.03285, held as $0.04 after rounding up (§9.3).
-Three €0.01 instalments free $0.01, $0.01, then the remaining $0.02. The total is $0.04.
-
-A consequence worth stating: an instalment worth less than one minor unit of the program's
-currency frees nothing at the time. It is still recorded, and later repayments catch up.
-
-### 4.5 Over limit
-
-Treasury owns the credit limit and may cut it below what a program already has reserved.
-Existing reservations are commitments; they cannot be torn up to fit a smaller limit. So the
-cut is applied and the program sits **over limit**:
-
-- `availableCapacity` goes negative;
-- every new reservation is refused, because any positive amount exceeds what is available;
-- repayments still free capacity, and the program returns to normal once reserved falls back
-  under the limit.
-
-**Trade-off.** The alternative is to refuse treasury's instruction, which would leave this
-service and the system of record disagreeing about the limit — the worse failure, and one
-nobody would notice. This is why the database constraint is `reserved >= 0` rather than
-`reserved <= limit`: the tighter rule cannot be true while treasury can move the limit.
-
-## 5. Use cases (CQRS)
-
-The application layer uses `@nestjs/cqrs` — one command or query per use case, dispatched
-through the bus:
-
-| Message | Kind |
-| --- | --- |
-| `ReserveCapacityCommand` | command |
-| `RecordRepaymentCommand` | command |
-| `OpenProgramCommand` | command |
-| `GetProgramCapacityQuery` | query |
-| `ListReservationsQuery` | query |
-
-The domain does **not** extend the `AggregateRoot` from `@nestjs/cqrs`. Our own base class
-in `shared/domain` collects raised events; the command handler drains them, writes them to
-the ledger inside the transaction, and publishes them to the `EventBus` after it commits.
-That keeps the domain framework-free while still getting a publisher for free — which is
-precisely the hook Kafka attaches to later.
-
-Handlers return **views** — plain data built from the aggregates — so aggregates never leave
-the layer that is allowed to change them. Queries go through a `CapacityReadModel` port that
-reads without locks; nothing it returns is ever used to decide whether capacity is available.
-
-Reserve, end to end:
-
-1. Controller validates the request DTO; the guard has already resolved the caller's scope.
-2. The program's currency is read through the read model — safe without a lock, because a
-   currency never changes — and if the invoice's differs, `ExchangeRateProvider.rateFor(...)`
-   fetches the rate. Both happen **before** any transaction is opened (§6); a unit test
-   asserts the rate provider is never called while a transaction is open.
-3. Handler opens a transaction and locks the program row (`findByIdForUpdate`).
-4. If the invoice already has an active reservation on this program, the existing one is
-   returned unchanged (§7).
-5. `program.reserveFor(...)` converts, checks capacity, and either throws
-   `InsufficientCapacityError` or moves the counter and returns a `Reservation`.
-6. Program, reservation and ledger rows are written; the transaction commits; events are
-   published.
-
-Recording a repayment is the mirror: lock the program, load the reservation, check the
-repayment id has not been applied already, `program.release(...)`, write, commit, publish.
-No rate lookup is needed — the reservation carries its own.
-
-## 6. Concurrency — pessimistic locking
-
-The contended counter is the core risk in this service, and the contention is structural,
-not incidental: every reservation and repayment against a program updates the same row.
-A batch job approving twenty invoices on one program is twenty writers on one row.
-
-**Chosen: lock the program row for the duration of the transaction.**
-
-```sql
-SELECT * FROM programs WHERE id = $1 FOR UPDATE;
-```
-
-Writers on one program queue and run one at a time; writers on different programs never
-block each other. Under the lock, the aggregate's check-then-write is race-free, so the
-invariant stays where it belongs — in the domain — and the database only has to serialise.
-
-**Why not optimistic locking.** A version column with compare-and-set holds no locks, but
-under a burst on one program only one writer wins each round: twenty concurrent reservations
-cost on the order of two hundred attempts, each redoing its reads and its insert. Worse,
-once a bounded retry budget runs out, a reservation is **rejected even though capacity was
-available** — it failed from bad luck, not because the program was full. For a financing
-product that is a business defect, not a performance one.
-
-**Why not a single conditional `UPDATE`.** `UPDATE … SET reserved = reserved + $1 WHERE
-limit − reserved ≥ $1` is correct and holds the row lock for the shortest possible time,
-but the check that actually protects the limit moves into SQL and the aggregate's own check
-becomes advisory. That is a fair trade in many ledgers; here it would hollow out the model.
-
-**What pessimistic locking costs, and how each cost is bounded:**
-
-| Cost | Mitigation |
-| --- | --- |
-| Throughput per program is serialised — ~1 / transaction time | Keep transactions short; different programs are independent. Far above realistic approval rates. |
-| Anything slow inside the lock stalls every waiter | **No I/O inside the lock.** The FX rate is fetched before the transaction opens; the transaction contains only database statements. |
-| Waiters hold pooled connections | `lock_timeout` (a few seconds) so waiters give up with a retryable `503 CAPACITY_BUSY` rather than exhausting the pool. |
-| A stalled holder blocks everyone behind it | `idle_in_transaction_session_timeout` bounds how long an abandoned transaction can hold the lock. |
-| Deadlocks | Structurally impossible as long as each transaction locks exactly one program row, first, before touching reservations. That ordering rule is load-bearing. |
-
-**The `version` column stays** as a cheap assertion — under the lock a mismatch should be
-impossible, so one appearing means a bug — and as a ready-made ETag for the HTTP layer.
-
-## 7. Idempotency
-
-**Reservations.** An invoice may hold at most one live reservation against a program:
-
-```sql
-CREATE UNIQUE INDEX ON reservations (program_id, invoice_id) WHERE status = 'ACTIVE';
-```
-
-Under the program lock, the handler's "does this invoice already have an active
-reservation?" check is race-free. A replay **for the same amount** returns the existing
-reservation (`created: false`) instead of creating a second hold; a request for a
-**different** amount is refused with `INVOICE_ALREADY_RESERVED`, since it cannot be a retry
-and guessing which amount was meant would be wrong half the time. The index is the backstop
-for any path that skips the check. Once a reservation is fully repaid the invoice can be
-reserved again.
-
-**Known limitation.** A reservation replay is recognised only while the reservation it
-repeats is still active. A retry delivered *after* the invoice has been fully repaid would
-create a new reservation. Closing that gap needs a client-supplied idempotency key on
-reservations, as repayments already have; it is deferred because the invoicing context is
-not expected to re-approve an invoice it has just seen repaid, and the gap is documented
-rather than assumed away.
-
-**Programs** are opened under a caller-supplied id — the treasury feed will refer to programs
-by their upstream ids — so opening is idempotent the same way: the same id with the same
-limit returns the existing program, a different limit is refused with
-`PROGRAM_ALREADY_EXISTS`. The handler inserts first and looks only on conflict, so the unique
-key settles concurrent opens rather than a check that could race.
-
-**Repayments.** Full release was naturally idempotent — a second attempt found nothing
-left to release — but a partial one is not: "repay €40" replayed would free capacity twice.
-Every repayment therefore carries a `RepaymentId` from the caller, recorded on its ledger
-row under a unique constraint. A replay with the same id returns the original outcome
-(`replayed: true`) without applying anything; a replay that reuses the id with a *different*
-amount or for a *different* invoice is refused with `REPAYMENT_ID_REUSED`, because the caller
-has made a mistake that should not be silently papered over. A replay of "repay whatever is
-outstanding" (no amount) matches whatever that turned out to be.
-
-Both guarantees are tested under concurrent delivery against real Postgres: five copies of
-one reservation arriving at once hold capacity once, and five copies of one repayment release
-it once.
-
-## 8. The capacity ledger
-
-Every change to a program's `reservedAmount` produces exactly one immutable row in
-`capacity_movements`, written in the same transaction as the counter:
-
-| Type | Written when | Amount |
+| Message | Kind | Entry point |
 | --- | --- | --- |
-| `RESERVE` | a reservation is made | capacity held, program currency |
-| `RELEASE` | a repayment is applied | capacity freed (may be zero), plus the repayment in invoice currency |
+| `ApplyTreasuryUpdateCommand` | command | Kafka (§3.8) — opens or updates a program |
+| `ReserveCapacityCommand` | command | HTTP |
+| `RecordRepaymentCommand` | command | HTTP |
+| `GetProgramCapacityQuery` | query | HTTP |
+| `ListReservationsQuery` | query | HTTP |
 
-The rows are the domain events (`CapacityReserved`, `CapacityReleased`) persisted — those
-already carry everything a row needs, so the ledger is a writer, not a second model.
+Command handlers: lock the program (`lockById`) → call the domain → save → write the ledger and
+the outbox → commit. The outbox relay then publishes the events to Kafka (§3.11). When the
+treasury handler finds no program to lock, it opens one with `Program.openFromTreasury` and
+inserts it.
 
-What it buys:
+For a reservation in another currency, the FX rate is fetched before the transaction opens.
 
-- **Audit.** Every movement of capacity is explained by a row that is never updated or
-  deleted, with the repayment that caused it.
-- **Drift detection.** `SUM(movements)` must equal the counter at all times (§4.2).
-- **Repayment idempotency.** The unique `repayment_id` lives here (§7).
-- **Somewhere for reconciliation to land.** Treasury corrections are not tied to any
-  invoice; without a ledger they would overwrite the counter and leave no trace. They will
-  be recorded as `ADJUSTMENT` movements (§13).
+Handlers return **views** (plain data), not aggregates. Queries go through `CapacityReadModel`,
+which reads without locks. The current time comes from an injected `Clock`.
 
-**This is not event sourcing**, and the distinction matters. In event sourcing the events
-are the system of record and current state is rebuilt by replaying them, which brings
-snapshots, replay tooling and versioned event schemas. Here the counter remains the
-authority the capacity check reads; the ledger is an audit log alongside it. Nothing in the
-brief needs more, and the extra machinery would be cost without benefit.
+### 3.4 Concurrency
 
-## 9. Money and foreign exchange
+Each command locks its program row with `SELECT … FOR UPDATE` for the whole transaction. Writers
+to the same program run one at a time; writers to different programs run in parallel. No
+network calls happen inside the transaction, and each transaction locks exactly one program row
+before touching reservations.
 
-### 9.1 Representation
+| Setting | Effect |
+| --- | --- |
+| `lock_timeout` (3 s) | a waiter gives up with `503 CAPACITY_BUSY` |
+| `statement_timeout` (5 s) | caps any single statement |
+| `idle_in_transaction_session_timeout` / transaction timeout (10 s) | frees a lock held by a stalled transaction |
 
-Amounts are integer minor units held as `bigint`, always paired with a currency. `Money`
-refuses cross-currency arithmetic — adding USD to EUR is an error, not a runtime surprise.
-No floating point is used anywhere in the money path. Exchange rates are fixed-scale
-decimals (eight places), and conversion is a single integer division, so there is no
-intermediate binary floating-point value to lose precision in.
+`version` is incremented on every save and checked on write.
 
-### 9.2 Conversion and the rate snapshot
+### 3.5 Capacity ledger
 
-A program's capacity is denominated in a single currency. An invoice in a different currency
-is converted at reservation time, and the rate used is stored on the reservation. Repayments
-are converted back through that same stored rate — never a fresh one.
+Every change to `reservedAmount` writes one row to `capacity_movements` (`RESERVE` or `RELEASE`)
+in the same transaction, from the `CapacityReserved` / `CapacityReleased` events. The ledger
+holds the unique `repayment_id` used to detect repeated repayments. Current state is read from
+`programs.reserved_minor`, not rebuilt from the ledger.
 
-**Trade-off.** Capacity freed will not equal the invoice's present-day value if the rate
-has moved since. This is deliberate. Re-converting at repayment would make reserved and
-released amounts disagree, so every rate movement would leak capacity in one direction or
-the other, and available capacity would drift without bound and without anyone noticing.
-Snapshotting keeps the capacity ledger internally consistent. Reconciling economic value
-against the treasury system's view is what the bulk reconciliation messages are for — that
-is a reconciliation problem, and it should be solved by reconciliation, not by arithmetic
-that quietly disagrees with itself.
+### 3.6 Persistence
 
-### 9.3 Rounding
+PostgreSQL through Prisma. Domain objects and Prisma rows are converted by explicit mappers in
+`infrastructure/persistence/prisma/mappers.ts`.
 
-| Operation | Mode | Why |
-| --- | --- | --- |
-| Reserve (convert invoice → program currency) | `CEILING` | The hold must cover the exposure; rounding can never be what breaches a limit. |
-| Partial repayment (release a share) | `FLOOR`, on the running total | Never free more than the share actually repaid. |
-| Final repayment | exact remainder | Settles the difference, so released = reserved to the minor unit. |
+| Table | Contents |
+| --- | --- |
+| `programs` | limit, reserved counter, status, version, treasury sequence |
+| `reservations` | invoice and reserved amounts, rate snapshot, repaid/released, status |
+| `capacity_movements` | the ledger, append-only |
+| `treasury_events` | every accepted treasury message with outcome and raw payload, append-only |
+| `outbox_events` | events waiting to be published, in `position` order; marked published by the relay |
 
-The reserved amount is not a settlement figure — nobody is ever paid it. It is a risk
-exposure hold against a credit limit, and exposure calculations in credit systems round
-conservatively, because their purpose is to bound risk rather than to state a value fairly.
-The cost is a sub-cent over-hold per invoice, held a little longer during repayment, which
-the final repayment returns intact.
+```mermaid
+erDiagram
+    outbox_events {
+        uuid id PK "the published eventId"
+        bigint position UK "publish order"
+        text program_id "message key; no FK"
+        text event_type
+        jsonb payload
+        timestamptz occurred_at
+        timestamptz created_at
+        timestamptz published_at "null until the relay publishes it"
+    }
 
-The usual argument for banker's rounding is cumulative bias across many roundings. It does
-not apply: each reservation is rounded once, partial releases are computed from the running
-total rather than rounded per instalment, and the final repayment settles exactly. Nothing
-accumulates.
+    programs ||--o{ reservations : "holds"
+    programs ||--o{ capacity_movements : "ledger of"
+    programs ||--o{ treasury_events : "updated by"
+    reservations ||--|{ capacity_movements : "moved by"
 
-If a disbursement or settlement figure is introduced later, it is a different number and
-takes conventional `HALF_UP`. Rounding policy attaches to the purpose of a figure, not to
-the system as a whole.
+    programs {
+        text id PK
+        char3 currency UK "unique with id; target of the composite FKs"
+        bigint credit_limit_minor
+        bigint reserved_minor "counter the capacity check reads"
+        enum status "ACTIVE | SUSPENDED"
+        int version
+        bigint treasury_sequence "last treasury sequence applied"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    reservations {
+        text id PK
+        text program_id FK "with reserved_currency"
+        text invoice_id "one ACTIVE reservation per program + invoice"
+        char3 invoice_currency
+        bigint invoice_minor
+        char3 reserved_currency FK "always the program's currency"
+        bigint reserved_minor
+        decimal exchange_rate "null when no conversion"
+        timestamptz rate_as_of
+        bigint repaid_minor
+        bigint released_minor
+        enum status "ACTIVE | RELEASED"
+        timestamptz reserved_at
+        timestamptz released_at
+    }
+    capacity_movements {
+        uuid id PK
+        text program_id FK "with currency"
+        text reservation_id FK
+        enum type "RESERVE | RELEASE; one RESERVE per reservation"
+        char3 currency FK "the program's currency"
+        bigint amount_minor
+        bigint available_after_minor
+        text repayment_id UK "unique per program; RELEASE only"
+        char3 repaid_currency
+        bigint repaid_minor
+        timestamptz occurred_at
+        timestamptz recorded_at
+    }
+    treasury_events {
+        uuid id PK
+        text program_id FK
+        text event_id UK "treasury's id; deduplication key"
+        text kind
+        bigint sequence
+        bool applied
+        text reason
+        jsonb payload "the message as received"
+        timestamptz occurred_at
+        timestamptz recorded_at
+    }
+```
 
-## 10. HTTP API
+`capacity_movements` and `treasury_events` are append-only (triggers reject `UPDATE` and
+`DELETE`). `outbox_events` stands alone: it has no foreign keys, being a queue of messages
+rather than part of the model (§3.11).
+
+Amounts are stored as `BIGINT` minor units beside a currency code. The database also enforces
+the main rules (Prisma schema plus hand-written SQL in the migrations):
+
+- `CHECK`s — positive limit, `reserved ≥ 0`, `0 ≤ repaid ≤ invoice`, `0 ≤ released ≤ reserved`,
+  `RELEASED` ⇔ fully repaid ⇔ `released_at` set, rate and its timestamp set together
+- partial unique indexes — one active reservation per invoice, one `RESERVE` per reservation
+- composite foreign keys on `(program_id, currency)` — a reservation's held amount and every
+  ledger row are in their program's currency (the invoice itself may be in any currency), and a
+  program's currency cannot be changed once anything refers to it (`ON UPDATE RESTRICT`)
+- triggers rejecting `UPDATE`/`DELETE` on `capacity_movements` and `treasury_events`
+
+### 3.7 HTTP API
 
 | Endpoint | Scope | Success |
 | --- | --- | --- |
-| `POST /programs` | `programs:admin` | 201 opened · 200 identical repeat |
 | `GET /programs/:programId/capacity` | `capacity:read` | 200 |
-| `POST /programs/:programId/reservations` | `capacity:write` | 201 reserved · 200 identical repeat |
-| `GET /programs/:programId/reservations?status=&limit=&cursor=` | `capacity:read` | 200, keyset-paged |
-| `POST /programs/:programId/reservations/:invoiceId/repayments` | `capacity:write` | 201 applied · 200 replayed id |
-| `GET /health/live`, `GET /health/ready` | none | 200 · 503 when the database is unreachable |
+| `POST /programs/:programId/reservations` | `reservations:write` | 201 reserved · 200 identical repeat |
+| `GET /programs/:programId/reservations?status=&limit=&cursor=` | `capacity:read` | 200, cursor-paged |
+| `POST /programs/:programId/reservations/:invoiceId/repayments` | `repayments:write` | 201 applied · 200 replayed |
+| `GET /health/live`, `GET /health/ready` | none | 200 · 503 when the database is down |
 
-A repayment is a `POST` that creates a record, not a `DELETE` of the reservation — nothing is
-deleted. Its body carries the caller's `repaymentId` and optionally an amount; omitting it
-repays whatever is outstanding. The status code distinguishes a first application (201) from
-a recognised repeat (200), so a client can tell without comparing bodies.
+**Authentication and authorization.** Bearer JWTs (HS256) with the algorithm pinned and issuer,
+audience and expiry checked. Two global guards: authentication on every route except those
+marked `@Public()` (the health probes); authorization requiring every route to declare
+`@RequireScopes(...)` and checking any `:programId` against the token's `programs` claim (`"*"`
+or a list of ids).
 
-### 10.1 Authentication and authorization
+| Claim | Required | Used for |
+| --- | --- | --- |
+| `sub` | yes | the caller; written to the request log |
+| `iss`, `aud` | yes | must match `JWT_ISSUER` and `JWT_AUDIENCE` |
+| `exp` | yes | expiry, with `JWT_CLOCK_TOLERANCE_SECONDS` of leeway |
+| `scope` | no | space-separated scopes; none when absent |
+| `programs` | no | `"*"` or a list of program ids; none when absent |
 
-Bearer JWTs, HS256, verified with the algorithm pinned — a token cannot choose its own, so
-`alg: none` and algorithm-substitution tokens are refused — and with issuer, audience and
-expiry all checked. Callers are told only that a token is invalid; which check failed goes
-to the log, because the precise reason helps an attacker more than a legitimate client.
+One scope per operation, because different systems perform them: `capacity:read` for clients
+reading availability, `reservations:write` for the system that approves invoices, and
+`repayments:write` for the one that learns of repayments.
 
-Two guards, both registered globally and both **default-deny**:
+**Input.** Parsed with zod directly into domain values. Amounts are decimal strings, unknown
+fields are rejected, ids are URL-safe, bodies are limited to 16 KB.
 
-- **Authentication** runs on every route unless it is marked `@Public()` — only the health
-  probes are. A new endpoint is protected unless someone decides otherwise.
-- **Authorization** requires every authenticated route to declare `@RequireScopes(...)`; a
-  route that forgets is refused, not opened. It then checks any `:programId` in the path
-  against the token's `programs` claim — `"*"` or a list of ids — with no code in the
-  controller, so no controller can forget. A token without a `programs` claim may touch no
-  program at all: blanket access has to be granted explicitly.
+**Errors.** RFC 9457 `application/problem+json` with a `code`, a `detail`, and extra fields where
+relevant (e.g. `requested` / `available`).
 
-**Trade-off.** A shared secret keeps local runs self-contained. Behind a real identity
-provider the verifier would check asymmetric tokens against its JWKS instead; with `jose`
-that changes how the key is obtained and nothing else, and it is confined to one class.
-
-### 10.2 Input
-
-Bodies and query strings are parsed with zod straight into domain values, so a request that
-passes validation already holds `Money`. Amounts must be decimal *strings* — a JSON number has
-been through a binary float before the service sees it. Objects are strict: in a money API a
-misspelt `ammount` silently ignored is worse than one refused. Ids are limited to URL-safe
-characters. Bodies over 16 KB are refused; the largest legitimate one is a few hundred bytes.
-
-### 10.3 Errors
-
-Every error is RFC 9457 `application/problem+json` with a stable `code` to branch on, a
-`detail` for people, and structured fields where a client would otherwise parse prose — an
-`INSUFFICIENT_CAPACITY` carries `requested` and `available`; a validation failure lists every
-issue with its path, not just the first. 401s carry `WWW-Authenticate`; `CAPACITY_BUSY`
-carries `Retry-After`.
-
-| Code | Status |
+| Status | Codes |
 | --- | --- |
-| `VALIDATION_FAILED` / `MALFORMED_JSON` / `INVALID_QUERY` | 400 |
-| `UNAUTHENTICATED` | 401 |
-| `FORBIDDEN` | 403 |
-| `PROGRAM_NOT_FOUND` / `RESERVATION_NOT_FOUND` / `NOT_FOUND` | 404 |
-| `INSUFFICIENT_CAPACITY` | 409 |
-| `PROGRAM_NOT_ACTIVE` | 409 |
-| `PROGRAM_ALREADY_EXISTS` | 409 |
-| `INVOICE_ALREADY_RESERVED` | 409 |
-| `RESERVATION_ALREADY_RELEASED` | 409 |
-| `REPAYMENT_ID_REUSED` | 409 |
-| `PAYLOAD_TOO_LARGE` | 413 |
-| `INVALID_AMOUNT` | 422 |
-| `REPAYMENT_EXCEEDS_OUTSTANDING` | 422 |
-| `REPAYMENT_CURRENCY_MISMATCH` | 422 |
-| `CURRENCY_NOT_CONVERTIBLE` / `UNSUPPORTED_CURRENCY` | 422 |
-| `INTERNAL_ERROR` | 500 — includes `INVARIANT_VIOLATION`; never the caller's fault |
-| `CAPACITY_BUSY` (lock timeout) | 503 with `Retry-After` |
+| 400 | `VALIDATION_FAILED`, `MALFORMED_JSON`, `INVALID_QUERY` |
+| 401 / 403 | `UNAUTHENTICATED` / `FORBIDDEN` |
+| 404 | `PROGRAM_NOT_FOUND`, `RESERVATION_NOT_FOUND`, `NOT_FOUND` |
+| 409 | `INSUFFICIENT_CAPACITY`, `PROGRAM_NOT_ACTIVE`, `INVOICE_ALREADY_RESERVED`, `RESERVATION_ALREADY_RELEASED`, `REPAYMENT_ID_REUSED` |
+| 413 | `PAYLOAD_TOO_LARGE` |
+| 422 | `INVALID_AMOUNT`, `REPAYMENT_EXCEEDS_OUTSTANDING`, `REPAYMENT_CURRENCY_MISMATCH`, `CURRENCY_NOT_CONVERTIBLE`, `UNSUPPORTED_CURRENCY` |
+| 500 | `INTERNAL_ERROR` (includes invariant violations and unmapped codes) |
+| 503 | `CAPACITY_BUSY`, with `Retry-After` |
 
-409 means the request conflicts with current state, so resending it unchanged will not help;
-422 means the request itself carries a value the rules reject. A 500 says nothing about its
-cause in the response — the details go to the log. An error code that no table maps is also
-a 500, so a newly added domain error cannot leak through as something a client might retry.
+Domain error codes are mapped to statuses in `presentation/http/error-statuses.ts`.
 
-The domain layer never mentions HTTP status codes.
+### 3.8 Treasury feed
 
-### 10.4 Operations
+Consumed in `contexts/capacity/infrastructure/messaging/`. It is the only way programs are
+opened and their limits and status changed. Each type carries exactly what it is about, and
+nothing else is accepted:
 
-- **Configuration** is read from the environment and validated before Nest starts, reporting
-  every problem at once. In production it refuses the example JWT secret and requires real
-  exchange rates rather than the built-in development table.
-- **Health**: `/health/live` does not touch the database, so a database outage makes the
-  service unready rather than getting it restarted in a loop; `/health/ready` does.
-- **Logging**: one line per request — method, path, status, duration and caller — written
-  from middleware rather than an interceptor, because interceptors run after guards and would
-  never see the 401s and 403s an audit trail most needs.
-- **Shutdown** closes the connection pool once in-flight requests finish.
+| Event type | Meaning | Carries |
+| --- | --- | --- |
+| `program.capacity.changed` | the limit changed | `creditLimit` only |
+| `program.status.changed` | the status changed | `status` only |
+| `program.state.reconciled` | periodic bulk reconciliation: the full state again | `creditLimit` and `status` |
 
-## 11. Persistence
-
-### 11.1 Mapping
-
-Domain models and Prisma models are separate types joined by explicit mappers. Prisma's
-generated types are a description of table shape, not of business behaviour, and letting
-them into the domain would put the schema in charge of the model.
-
-**Trade-off.** This is more code than using Prisma's types directly. It is the price of
-being able to change the schema without changing the domain, and vice versa.
-
-### 11.2 The database as a last line of defence
-
-The aggregates are the primary guard of every invariant. The schema repeats the ones that
-can be stated as constraints, so that a bug which slips past the domain and the lock still
-cannot write a state the model says is impossible:
-
-```sql
-CHECK (credit_limit_minor > 0)
-CHECK (reserved_minor >= 0 AND reserved_minor <= credit_limit_minor)
-CHECK (repaid_minor  >= 0 AND repaid_minor  <= invoice_minor)
-CHECK (released_minor >= 0 AND released_minor <= reserved_minor)
-CHECK (amount_minor >= 0)                        -- ledger
+```json
+{
+  "eventId": "treasury-8f1c",
+  "eventType": "program.status.changed",
+  "occurredAt": "2026-09-21T10:00:00Z",
+  "sequence": 42,
+  "program": { "id": "program-1", "status": "SUSPENDED" }
+}
 ```
 
-Two further guards are structural rather than `CHECK`s:
+- `status` is `ACTIVE` or `SUSPENDED`.
+- A program is opened by the first capacity change or reconciliation for its id. A status change
+  cannot open one (there is no limit to open it with) and is dead-lettered as `PROGRAM_NOT_FOUND`.
+- A reconciliation is the full state, so after it the program matches treasury in everything
+  treasury owns — including anything an earlier message missed.
+- `sequence` is per program across all three types.
 
-- **Composite foreign keys** on `(program_id, currency)` pin a reservation's held currency,
-  and every ledger row's currency, to its program's. A reservation cannot hold euros against
-  a dollar program even if code tried to write one.
-- **A trigger rejects any `UPDATE` or `DELETE`** on `capacity_movements`, so the ledger is
-  append-only in the database, not merely by convention. (It does not stop `TRUNCATE`; in
-  production the application's role should not be granted that.)
+Flow: `treasury-feed` (subscription) → `treasury-message-processor` (error handling) →
+`treasury-message` (parsing) → `ApplyTreasuryUpdateHandler` → `Program.applyTreasuryState`.
 
-The concurrency integration test proves the lock is load-bearing: with `FOR UPDATE` removed,
-only 3 of 30 concurrent reservations succeed — the rest are lost updates, which the `version`
-assertion catches and reports rather than letting the program oversubscribe.
+- **Parsing** — `treasury-message.ts` is the only file that knows treasury's message format. It
+  validates with zod (unknown fields rejected), converts amounts to `Money` and builds an
+  `ApplyTreasuryUpdateCommand`.
+- **Ordering** — each message has a per-program `sequence`; a message not newer than the last
+  applied one is recorded and ignored.
+- **Opening** — a message for an unknown program id opens the program. If two first messages
+  for the same id race, the database's unique key lets one insert win; the other is retried
+  once and applied as an update.
+- **Duplicates** — `eventId` is unique in `treasury_events`, written in the same transaction as
+  the update.
 
-Amounts are stored as `BIGINT` minor units next to a currency code — a single `NUMERIC(p, 2)`
-column cannot represent currencies that subdivide into zero or three places. `BIGINT`'s
-ceiling of about 9.2 × 10¹⁸ minor units is far beyond any realistic program.
+| Failure | Examples | Action |
+| --- | --- | --- |
+| Permanent | invalid JSON, wrong schema, a credit limit that is not positive, an amount in another currency than the program's | published to the dead-letter topic with the original bytes; consumption continues |
+| Temporary | program locked, database unavailable | error rethrown after a backoff (200 ms doubling to 10 s); offset not committed; message redelivered |
 
-## 12. Testing strategy
+Unrecognised errors are treated as temporary. The client redelivers a failed message
+immediately, so the backoff is what keeps an outage from becoming a tight retry loop; waiting
+holds the partition, which per-program order needs anyway. After ten consecutive failures each
+further one is logged as an error: the partition is stuck and someone should look.
+
+The consumer runs only when `KAFKA_ENABLED=true` (the default in `.env.example` and in the
+Docker stack). Brokers, topics, group id, TLS and SASL come from `KAFKA_*` environment variables.
+
+**Topics and client settings.** Production-shaped locally, so a difference shows up on a laptop
+rather than in a deploy:
+
+- **Provisioned, never auto-created.** The service does not create topics, and the local broker
+  has auto-creation off, as production brokers do. `docker/redpanda/create-topics.sh` creates
+  them (the `kafka-topics` Compose service, also run by `npm run infra:up`); in a real environment
+  the same settings live in infrastructure as code. At startup the service checks that its
+  topics exist and refuses to start if one does not, rather than waiting on a feed that will
+  never arrive.
+
+  | Topic | Partitions | Retention | Key |
+  | --- | --- | --- | --- |
+  | `treasury.program-capacity` (treasury's) | 3 | 7 days | program id |
+  | `treasury.program-capacity.dead-letter` | 1 | 30 days | original key |
+  | `capacity.events` | 6 | 7 days | program id |
+
+  Replication factor 1 locally (one broker); 3 with `min.insync.replicas=2` in production.
+  Partition counts are hard to raise later: adding partitions moves keys, and with them
+  per-program order.
+- **Producers are idempotent** (`acks=all`), so a retried batch is neither duplicated nor
+  reordered behind the one after it, and a send fails after 15 s rather than librdkafka's default
+  five minutes (`platform/kafka/kafka-client.ts`).
+- **TLS and SASL** (`KAFKA_SSL`, `KAFKA_SSL_CA_LOCATION`, `KAFKA_SASL_MECHANISM`,
+  `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD`). Off locally; in production the configuration is
+  rejected without both.
+
+Local tools that play the treasury system:
+
+- `npm run treasury` — publishes one message (`scripts/publish-treasury-message.ts`).
+- `treasury-seed` — a Docker Compose service that publishes two demo programs at startup
+  (`program-1`, 10,000,000 USD; `program-2`, 5,000,000 EUR).
+- Redpanda's HTTP proxy (port 18082) — lets HTTP clients such as the Postman collection publish.
+- Redpanda Console (port 8080) — a web UI to browse topics, read dead letters and publish.
+
+### 3.9 Configuration and operations
+
+- **Config** — environment variables, validated at startup. In production the example JWT
+  secret and the development FX table are rejected.
+- **FX rates** — a static rate table (`FX_RATES`), a stand-in for a live rate service (§4);
+  built-in illustrative rates outside production, where `FX_RATES` is required.
+- **Health** — `/health/live` does not query the database; `/health/ready` does. Kafka is
+  deliberately not part of readiness: without the broker the API still reserves and releases
+  correctly (limits are briefly stale, events wait in the outbox), and failing readiness would
+  take every instance out of the load balancer for an outage that does not stop them working.
+  Kafka problems surface instead as a refused start (missing topics), error logs (a stuck
+  partition, a failing relay) and, in production, consumer-lag alerts.
+- **Logging** — one line per request, written by middleware.
+- **API documentation** — OpenAPI 3.0 at `/docs` (Swagger UI) and `/docs/openapi.json`, no token
+  needed. Request schemas are generated from the zod schemas that validate requests; response
+  schemas live in `presentation/http/response-schemas.ts`, and an end-to-end test checks real
+  responses against them. The document is built in `src/api-docs.ts`.
+
+What is left for production — tokens from an identity provider (JWKS), the caller stored with
+each change, Kafka ACLs and metrics — is listed in §4.
+
+### 3.10 Testing
 
 | Layer | How |
 | --- | --- |
-| Domain | Pure Vitest. No Nest, no DB, no mocks. Invariants, rounding, and repayment sequences. |
-| Application | Handlers against in-memory fakes implementing the ports. |
-| Integration | Real Postgres: repositories, constraints, the lock, and the lock-timeout path. |
-| E2E | The whole app over HTTP with Supertest: auth attacks (expired, wrong audience, `alg: none`), scopes and program grants, every status in §10.3, and a real held lock surfacing as `503 CAPACITY_BUSY`. |
+| Domain | Vitest unit tests: rules, rounding, repayment sequences |
+| Application | handlers against in-memory fakes of the ports |
+| Integration | real Postgres and Kafka: repositories, constraints, locking, lock timeout, Kafka feed |
+| E2E | the whole app with a real Kafka topic: programs published by a stand-in treasury, then reservations, repayments, limit and status changes, auth and error statuses over HTTP (Supertest) |
+| API | the Postman collection, run with Newman (`npm run test:api`); it publishes its own program through the HTTP proxy |
 
-One integration test earns its keep above all others: N parallel reservations against a
-nearly exhausted program, asserting that the limit is never breached, that exactly the right
-number succeed, and that no reservation which fits is rejected. It has to run against real
-Postgres, because what it tests is the concurrency control, not the code around it.
+Integration and end-to-end runs start their own Postgres and Kafka (Redpanda) containers with
+Testcontainers (`test/infrastructure/global-setup.ts`) and remove them afterwards; each suite also
+creates its own Kafka topics.
 
-## 13. The treasury feed
+The outbox relay has its own integration test: a reservation and a repayment over HTTP arrive on
+the events topic in order, keyed by program, and are marked published.
 
-Treasury publishes to Kafka; we consume in `contexts/capacity/infrastructure/messaging/`.
-Two kinds of message, both carrying a program's **full state** rather than a delta:
+A concurrency test sends many parallel reservations to a nearly full program and checks that the
+limit is never exceeded and every reservation that fits succeeds.
 
-| Event type | Means | Carries |
-| --- | --- | --- |
-| `program.capacity.changed` | the credit limit moved | the new limit |
-| `program.state.reconciled` | periodic bulk reconciliation | the limit, plus treasury's view of what is reserved |
+### 3.11 Published events (transactional outbox)
 
-Full state rather than deltas is what makes the feed safe to reorder or replay: the newest
-message wins and nothing has to be replayed to arrive at the right answer.
+What this service announces, on `KAFKA_CAPACITY_EVENTS_TOPIC` (default `capacity.events`):
 
-### 13.1 The anti-corruption layer
+| `eventType` | When |
+| --- | --- |
+| `capacity.program-opened` | treasury's first message for a program opened it |
+| `capacity.reserved` | capacity was reserved for an invoice |
+| `capacity.released` | a repayment released capacity |
+| `capacity.credit-limit-changed` | treasury changed the limit (with `overLimit`) |
+| `capacity.program-status-changed` | treasury suspended or reactivated the program |
 
-`treasury-message.ts` is the only file that knows treasury's wire format — their field names,
-their envelope, their event-type strings. It validates a message and translates it into a
-command in our own language, holding our own value objects. A change at their end is a change
-there and nowhere else.
+```json
+{
+  "eventId": "b309d7c4-…",
+  "eventType": "capacity.reserved",
+  "occurredAt": "2026-09-22T16:13:27.123Z",
+  "programId": "program-1",
+  "data": {
+    "reservationId": "…",
+    "invoiceId": "invoice-1",
+    "invoiceAmount": { "amount": "100000.00", "currency": "EUR" },
+    "reservedAmount": { "amount": "109000.00", "currency": "USD" },
+    "availableAfter": { "amount": "9891000.00", "currency": "USD" }
+  }
+}
+```
 
-Amounts arrive as decimal strings and become `Money`; unknown fields are rejected rather than
-ignored, because an unexpected field more often means a contract change nobody read than a
-harmless extra.
+- **Written with the change.** Command handlers add their domain events to `outbox_events` in the
+  same transaction as the change, so an event exists if and only if its change committed. The
+  message is built then (`infrastructure/messaging/capacity-events.ts`, the public contract), so
+  an event with no contract fails the change rather than the relay.
+- **Published by the relay** (`OutboxRelay`, every `OUTBOX_POLL_INTERVAL_MS`, default 500 ms): it
+  takes the oldest unpublished events in `position` order, publishes them keyed by program id, and
+  marks them published — in one transaction, so an event is marked only after the broker
+  acknowledged it.
+- **Order.** A Postgres advisory lock lets one instance relay at a time, so events leave in the
+  order they were written, and the idempotent producer keeps each program's events in order on
+  their partition through retries. The lock is the relay's own and touches no program row, so the
+  Kafka call inside that transaction holds up no reservation.
+- **Why the send is inside the relay's transaction.** The business transaction never talks to
+  Kafka — it only writes the outbox row. The relay's transaction is a different, short one that
+  exists to hold the advisory lock and mark the batch; `send` sits inside it so that "marked"
+  can only follow "acknowledged". The cost is one pooled connection held for the length of a
+  send, bounded by the producer's 15 s delivery timeout; the transaction's own timeout is twice
+  that, so a broker outage fails the send and rolls back cleanly. Change data capture (Debezium
+  reading the outbox table from the WAL) removes the polling and the held connection, at the
+  price of running Kafka Connect; it is the step up if volume ever calls for it.
+- **At least once.** If publishing fails, nothing is marked and the batch is sent again; a
+  consumer drops a message whose `eventId` it has already seen (also in the `event-id` header).
+- **Off without Kafka.** With `KAFKA_ENABLED=false` events accumulate in the outbox and are
+  published once the relay runs.
+- **Not yet:** a clean-up of published rows (they are kept, and could be pruned after a retention
+  period).
 
-### 13.2 Ordering, duplicates and what treasury does not own
+## 4. Before production
 
-- **Ordering.** Every message carries a per-program `sequence`. Anything not strictly newer
-  than the sequence already applied is recorded and ignored — Kafka reorders, and that is
-  routine rather than exceptional.
-- **Duplicates.** Each message's `eventId` is written to `treasury_events` under a unique
-  constraint in the same transaction as its effect, so at-least-once delivery applies once.
-  The table doubles as the audit trail: every message, applied or not, with the reason and
-  the payload exactly as it arrived.
-- **Reconciliation does not overwrite what we hold reserved.** Treasury's figure is compared
-  with ours, and a difference raises `CapacityDiscrepancyDetected` for someone to investigate.
-  Adopting their number would break the chain that explains ours — per-invoice reservations
-  and an immutable ledger — and silence the drift detector in §4.2. Money being wrong and
-  visible beats money being wrong and hidden.
+Deliberately left out of this version, and needed before it handles real money:
 
-### 13.3 Failure handling
+- **A live exchange-rate source.** Rates change continuously; a static table goes stale within
+  hours. Production needs a provider that calls a rate service, bound in `capacity.module.ts` in
+  place of `StaticExchangeRateProvider`, behind the existing `ExchangeRateProvider` port. It
+  should cache rates with a short refresh interval, refuse to convert when the newest rate is
+  older than a maximum age (`CURRENCY_NOT_CONVERTIBLE` rather than a reservation at an outdated
+  rate), and time out cleanly when the service is down. Nothing else changes: rates are already
+  fetched before the transaction opens, and each reservation stores the rate and its `asOf`.
 
-Each failure is one of two kinds, and telling them apart is the whole job of the consumer:
-
-| Kind | Examples | What happens |
-| --- | --- | --- |
-| **Permanent** — the same bytes will always fail | not JSON, not the agreed schema, unknown program | Published to the dead-letter topic with the reason and its original topic, partition and offset; the feed moves on rather than blocking the partition behind a message that can never pass. |
-| **Temporary** — the message is fine, the moment is not | a locked program, the database down | Rethrown: the offset is not committed and the message comes back. Dead-lettering these would throw away real capacity changes. |
-
-Anything unrecognised is treated as temporary. Parking a message wrongly loses a capacity
-change; retrying one wrongly is visible and recoverable.
-
-Dead letters keep the original bytes untouched, because whoever investigates needs what
-treasury actually sent, not this service's reading of it.
-
-### 13.4 Operating it
-
-The feed is off unless `KAFKA_ENABLED=true`, so the HTTP service runs with no broker at all.
-Topics are expected to exist before the service starts; when one does not, the consumer's
-metadata refresh is set to 30 seconds so it picks the topic up shortly after it appears
-rather than after librdkafka's five-minute default.
-
-### 13.5 Still deferred: publishing our own events
-
-Domain events are published in-process after commit. Nothing outside the service consumes
-them yet, so the transactional **outbox** that would be needed to publish them reliably is
-not built. The ledger is already written in the same transaction as the state it describes,
-so it can serve as that outbox with a `published_at` column when there is a consumer.
-
-## 14. Decision log
-
-| Decision | Chosen | Main alternative |
-| --- | --- | --- |
-| Persistence | PostgreSQL + Prisma | TypeORM |
-| Application layer | `@nestjs/cqrs` buses | Plain application services |
-| Concurrency control | Pessimistic `SELECT … FOR UPDATE` on the program row | Optimistic version + retry; conditional `UPDATE` |
-| Aggregates | Program and Reservation as separate roots, written in one transaction | Reservation as a child entity of Program |
-| Repayments | Partial, applied in instalments, idempotent by `RepaymentId` | Full release only |
-| Audit | Append-only capacity ledger alongside the counter | Reservation rows only; full event sourcing |
-| FX on repayment | Replay the snapshotted rate | Re-convert at live rate |
-| Rounding | `CEILING` to reserve, `FLOOR` on running total to release, exact final settlement | Half-up / banker's everywhere |
-| Database constraints | `CHECK` constraints mirroring the invariants | Domain checks only |
-| Domain ↔ persistence | Explicit mappers | Prisma types as domain models |
-| Auth | JWT bearer, default-deny guard | API keys, OAuth2 client credentials |
-| Treasury messages | Full state per message, ordered by sequence | Deltas replayed in order |
-| A limit cut below what is reserved | Accept it; the program goes over limit | Refuse treasury, or cancel reservations to fit |
-| Reconciliation mismatch | Report it; keep our own figure | Adopt treasury's reserved amount |
-| Unrecognised consumer failures | Retry, on the assumption they may clear | Dead-letter them |
+- **Tokens signed by an identity provider.** Tokens are HS256 with a shared secret, which keeps
+  local runs self-contained but means anything that can verify a token can also mint one.
+  Production should verify asymmetric tokens (RS256/ES256) against the identity provider's JWKS
+  endpoint. The change is confined to `src/iam/token-verifier.ts` and its configuration.
+- **Who made each change, stored with the data.** The caller (`sub`) is written to the request
+  log, but not to the ledger or the reservations, so the data says *what* changed and not *who*
+  changed it. Storing the caller on each ledger row (and on the reservation) would make the
+  audit trail complete without relying on log retention.
+- **Kafka ACLs and topic provisioning.** The service connects over TLS with SASL in production
+  (`KAFKA_SSL`, `KAFKA_SASL_*`; required when `NODE_ENV=production`), but the broker side is the
+  platform's: ACLs so that only treasury can publish to `treasury.program-capacity` — anything
+  that can publish there can open programs and change limits — and the topics themselves,
+  created by infrastructure as code with the settings in `docker/redpanda/create-topics.sh` and a
+  replication factor of 3 (`min.insync.replicas=2`).
+- **Metrics and alerting.** Consumer-group lag on the treasury feed, the outbox backlog and the
+  dead-letter topic's growth are what to alert on; today they show only in the logs (a partition
+  stuck behind a failing message is logged as an error after ten attempts).

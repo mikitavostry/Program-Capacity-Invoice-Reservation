@@ -2,10 +2,11 @@ import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { SignJWT } from 'jose';
 import type { App } from 'supertest/types.js';
+import { setupApiDocs } from '../../src/api-docs.js';
 import { AppModule } from '../../src/app.module.js';
 import { loadConfig } from '../../src/platform/config/app-config.js';
 import { APP_OPTIONS, configureApp } from '../../src/platform/http/configure-app.js';
-import { testDatabaseUrl } from '../integration/database.js';
+import { testDatabaseUrl } from '../infrastructure/database.js';
 
 export const E2E_AUTH = {
   secret: 'end-to-end-test-secret-long-enough-0123456789',
@@ -34,6 +35,7 @@ export async function createTestApp(env: Record<string, string> = {}): Promise<T
   }).compile();
 
   const app = configureApp(moduleRef.createNestApplication({ ...APP_OPTIONS, logger: false }));
+  setupApiDocs(app);
   await app.init();
 
   return {
@@ -54,7 +56,7 @@ export interface TokenOptions {
   readonly expiresAt?: number;
 }
 
-export const ALL_SCOPES = 'capacity:read capacity:write programs:admin';
+export const ALL_SCOPES = 'capacity:read reservations:write repayments:write';
 
 export async function token(options: TokenOptions = {}): Promise<string> {
   const claims: Record<string, unknown> = { scope: options.scope ?? ALL_SCOPES };

@@ -1,6 +1,7 @@
 import type { DomainEvent } from '../../../shared/domain/domain-event.js';
 import type { Money } from '../../../shared/money/money.js';
 import type { InvoiceId, ProgramId, RepaymentId, ReservationId } from './ids.js';
+import type { ProgramStatus } from './program.js';
 
 export class ProgramOpened implements DomainEvent {
   readonly eventName = 'ProgramOpened';
@@ -44,13 +45,7 @@ export class CapacityReserved implements DomainEvent {
   }
 }
 
-/**
- * A repayment was applied to a reservation, freeing some or all of the capacity it held.
- *
- * `releasedAmount` can be zero: a small partial repayment against a converted invoice may be
- * worth less than one minor unit of the program's currency, and releases round down. The
- * repayment is still recorded, and the final repayment settles whatever remains.
- */
+/** A repayment freed some or all of a reservation's hold. `releasedAmount` may be zero. */
 export class CapacityReleased implements DomainEvent {
   readonly eventName = 'CapacityReleased';
   readonly aggregateId: string;
@@ -58,9 +53,9 @@ export class CapacityReleased implements DomainEvent {
   readonly reservationId: ReservationId;
   readonly invoiceId: InvoiceId;
   readonly repaymentId: RepaymentId;
-  /** What was repaid, in the invoice's currency. */
+  /** In the invoice's currency. */
   readonly repaidAmount: Money;
-  /** The capacity this repayment freed, in the program's currency. */
+  /** In the program's currency. */
   readonly releasedAmount: Money;
   readonly reservationFullyReleased: boolean;
   readonly availableAfter: Money;
@@ -88,12 +83,6 @@ export class CapacityReleased implements DomainEvent {
   }
 }
 
-/**
- * Treasury changed a program's credit limit.
- *
- * `overLimit` says the new limit is below what is already reserved: existing holds stand and
- * no new capacity can be taken until repayments bring the program back under (§4.5).
- */
 export class CreditLimitChanged implements DomainEvent {
   readonly eventName = 'CreditLimitChanged';
   readonly aggregateId: string;
@@ -122,36 +111,24 @@ export class CreditLimitChanged implements DomainEvent {
   }
 }
 
-/**
- * Treasury's view of how much a program has reserved does not match ours.
- *
- * Raised, not repaired. Our figure is backed by per-invoice reservations and an immutable
- * ledger; overwriting it with a number we cannot explain would destroy that chain and the
- * drift detector with it. The discrepancy is surfaced for someone to investigate.
- */
-export class CapacityDiscrepancyDetected implements DomainEvent {
-  readonly eventName = 'CapacityDiscrepancyDetected';
+export class ProgramStatusChanged implements DomainEvent {
+  readonly eventName = 'ProgramStatusChanged';
   readonly aggregateId: string;
   readonly occurredAt: Date;
-  /** What treasury believes is reserved. */
-  readonly reportedAmount: Money;
-  /** What this service holds, and continues to hold. */
-  readonly reservedAmount: Money;
-  /** Reported minus ours: positive when treasury thinks more is held than we do. */
-  readonly difference: Money;
+  readonly previousStatus: ProgramStatus;
+  readonly status: ProgramStatus;
   readonly treasurySequence: number;
 
   constructor(params: {
     programId: ProgramId;
-    reportedAmount: Money;
-    reservedAmount: Money;
+    previousStatus: ProgramStatus;
+    status: ProgramStatus;
     treasurySequence: number;
     occurredAt: Date;
   }) {
     this.aggregateId = params.programId.value;
-    this.reportedAmount = params.reportedAmount;
-    this.reservedAmount = params.reservedAmount;
-    this.difference = params.reportedAmount.minus(params.reservedAmount);
+    this.previousStatus = params.previousStatus;
+    this.status = params.status;
     this.treasurySequence = params.treasurySequence;
     this.occurredAt = new Date(params.occurredAt);
   }

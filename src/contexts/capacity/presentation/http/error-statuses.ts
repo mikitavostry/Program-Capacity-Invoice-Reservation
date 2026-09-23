@@ -2,12 +2,8 @@ import { HttpStatus } from '@nestjs/common';
 import type { ErrorStatusTable } from '../../../../platform/http/problem-details.filter.js';
 
 /**
- * How this context's error codes read over HTTP.
- *
- * 409 means "the request was well-formed but conflicts with the current state" — retrying the
- * same request will not help until something changes. 422 means the request itself carries a
- * value the rules reject. `CAPACITY_BUSY` is the one 503: nothing was wrong with the request,
- * and the same request may well succeed a moment later.
+ * 409: conflicts with the current state. 422: the request carries a value the rules reject.
+ * 503 (`CAPACITY_BUSY`): nothing was wrong, and a retry may succeed.
  */
 export const CAPACITY_ERROR_STATUSES: ErrorStatusTable = {
   PROGRAM_NOT_FOUND: HttpStatus.NOT_FOUND,
@@ -15,7 +11,6 @@ export const CAPACITY_ERROR_STATUSES: ErrorStatusTable = {
 
   INSUFFICIENT_CAPACITY: HttpStatus.CONFLICT,
   PROGRAM_NOT_ACTIVE: HttpStatus.CONFLICT,
-  PROGRAM_ALREADY_EXISTS: HttpStatus.CONFLICT,
   INVOICE_ALREADY_RESERVED: HttpStatus.CONFLICT,
   RESERVATION_ALREADY_RELEASED: HttpStatus.CONFLICT,
   REPAYMENT_ID_REUSED: HttpStatus.CONFLICT,

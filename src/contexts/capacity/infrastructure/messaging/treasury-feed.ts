@@ -8,18 +8,18 @@ import {
 import { CommandBus } from '@nestjs/cqrs';
 import { APP_CONFIG, type AppConfig } from '../../../../platform/config/app-config.js';
 import {
+  assertTopicsExist,
   createKafkaClient,
+  createProducer,
   type KafkaConsumer,
   type KafkaProducer,
 } from '../../../../platform/kafka/kafka-client.js';
 import { DeadLetterPublisher } from './dead-letter-publisher.js';
-import { TreasuryMessageProcessor } from './treasury-consumer.js';
+import { TreasuryMessageProcessor } from './treasury-message-processor.js';
 
 /**
- * Owns the connection to the treasury feed: subscribes on startup, stops cleanly on shutdown.
- *
- * Switched off by configuration (`KAFKA_ENABLED`) by default, so the HTTP service runs with
- * no broker at all — locally, in tests, and in any deployment that does not consume the feed.
+ * Consumes the treasury topic, the only way programs are opened and their limits changed.
+ * With `KAFKA_ENABLED=false` the HTTP API still runs, but no program can appear.
  */
 @Injectable()
 export class TreasuryFeed implements OnApplicationBootstrap, OnApplicationShutdown {
@@ -44,8 +44,9 @@ export class TreasuryFeed implements OnApplicationBootstrap, OnApplicationShutdo
     }
 
     const kafka = createKafkaClient(this.config.kafka);
+    await assertTopicsExist(kafka, [treasuryTopic, deadLetterTopic]);
 
-    this.producer = kafka.producer();
+    this.producer = createProducer(kafka);
     await this.producer.connect();
 
     const processor = new TreasuryMessageProcessor(
@@ -56,14 +57,11 @@ export class TreasuryFeed implements OnApplicationBootstrap, OnApplicationShutdo
     this.consumer = kafka.consumer({
       kafkaJS: {
         groupId,
-        // From the beginning only when this group has no committed offsets: on restart it
-        // resumes where it left off, and at-least-once delivery is safe because applying a
-        // treasury event twice is a no-op.
+        // Applies only when the group has no committed offset yet.
         fromBeginning: true,
+        allowAutoTopicCreation: false,
       },
-      // Topics are expected to exist before the service starts. When one does not, the
-      // default five-minute metadata refresh leaves the feed looking dead for minutes after
-      // it appears; thirty seconds bounds that without polling the broker hard.
+      // Notices added partitions within 30 s instead of librdkafka's default 5 min.
       'topic.metadata.refresh.interval.ms': 30_000,
     });
 
@@ -81,8 +79,7 @@ export class TreasuryFeed implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   async stop(): Promise<void> {
-    // Disconnecting the consumer first lets an in-flight message finish and commit before the
-    // producer it may still need for a dead letter goes away.
+    // Consumer first: an in-flight message may still need the producer for a dead letter.
     await this.disconnect('consumer', this.consumer);
     this.consumer = null;
     await this.disconnect('producer', this.producer);

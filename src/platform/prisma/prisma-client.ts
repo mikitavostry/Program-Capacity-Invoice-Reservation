@@ -9,10 +9,7 @@ export interface PrismaClientOptions {
   readonly poolSize?: number;
 }
 
-/**
- * Builds the one Prisma client a process should hold. Each client owns a connection pool,
- * so creating one per request would exhaust the database long before it ran out of work.
- */
+/** One per process: each client owns a connection pool. */
 export function createPrismaClient(options: PrismaClientOptions): PrismaClient {
   const adapter = new PrismaPg({
     connectionString: options.connectionString,

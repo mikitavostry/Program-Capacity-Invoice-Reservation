@@ -10,15 +10,10 @@ export class UnsupportedCurrencyError extends DomainError {
 }
 
 /**
- * ISO 4217 codes with the number of decimal places each currency subdivides into.
- *
- * This is a curated subset rather than the full standard, and an unrecognised code is
- * rejected outright instead of being assumed to have two decimal places. That assumption is
- * how a JPY amount ends up a hundred times too small, and a financing limit is not the
- * place to find out. Extending the list is a deliberate act; guessing is not available.
+ * ISO 4217 codes and their minor-unit digits. A curated subset: an unknown code is refused
+ * rather than assumed to have two decimals, which would make a JPY amount 100 times too small.
  */
 const MINOR_UNIT_DIGITS: ReadonlyMap<string, number> = new Map([
-  // Two decimal places — the common case.
   ['USD', 2],
   ['EUR', 2],
   ['GBP', 2],
@@ -40,12 +35,10 @@ const MINOR_UNIT_DIGITS: ReadonlyMap<string, number> = new Map([
   ['ZAR', 2],
   ['TRY', 2],
   ['AED', 2],
-  // No minor unit at all.
   ['JPY', 0],
   ['KRW', 0],
   ['ISK', 0],
   ['VND', 0],
-  // Three decimal places.
   ['BHD', 3],
   ['KWD', 3],
   ['JOD', 3],
@@ -53,18 +46,11 @@ const MINOR_UNIT_DIGITS: ReadonlyMap<string, number> = new Map([
   ['TND', 3],
 ]);
 
-/**
- * An ISO 4217 currency, together with how finely it subdivides.
- *
- * Instances are interned, so `Currency.of('USD')` always returns the same object and the
- * scaling factor is computed once per currency rather than once per amount.
- */
 export class Currency extends ValueObject {
   private static readonly instances = new Map<string, Currency>();
 
   readonly code: string;
   readonly minorUnitDigits: number;
-  /** Minor units in one major unit: 100 for USD, 1 for JPY, 1000 for BHD. */
   readonly minorUnitsPerUnit: bigint;
 
   private constructor(code: string, minorUnitDigits: number) {

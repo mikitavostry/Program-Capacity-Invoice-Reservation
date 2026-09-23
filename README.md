@@ -1,253 +1,253 @@
 # Program Capacity & Invoice Reservation
 
 Service that tracks a financing program's credit capacity in real time: invoices reserve
-capacity when approved for early payment, and release it back when repaid. Capacity data
-also arrives from an external treasury system over Kafka, including periodic bulk
+capacity when approved for early payment, and release it back when repaid. Programs and their
+credit limits come from an external treasury system over Kafka, including periodic bulk
 reconciliation messages. Programs and invoices may be denominated in different currencies.
 
-> Status: complete and runnable — HTTP API, authentication, and the Kafka treasury feed.
+What the service does, how it is built, and the assumptions and trade-offs behind it:
+**[docs/architecture.md](docs/architecture.md)**.
 
 ## Stack
 
-| Concern    | Choice                                  |
-| ---------- | --------------------------------------- |
-| Runtime    | Node.js >= 22.19                        |
-| Framework  | NestJS 12 (ESM, `"type": "module"`)     |
-| Language   | TypeScript 6, `strict` mode             |
-| Database   | PostgreSQL 17 via Prisma 7.10 (pinned)  |
+| Concern    | Choice                                     |
+| ---------- | ------------------------------------------ |
+| Runtime    | Node.js >= 22.19                           |
+| Framework  | NestJS 12 (ESM, `"type": "module"`)        |
+| Language   | TypeScript 6, `strict` mode                |
+| Database   | PostgreSQL 17 via Prisma 7.10 (pinned)     |
 | Messaging  | Kafka (Redpanda locally), Confluent client |
-| Tests      | Vitest: unit, integration, e2e          |
-| Lint       | oxlint                                  |
-| Formatting | Prettier                                |
+| Tests      | Vitest: unit, integration, e2e; Newman     |
+| Lint       | oxlint                                     |
+| Formatting | Prettier                                   |
 
-Because the project is ESM, relative imports must carry a `.js` extension
+The project is ESM, so relative imports carry a `.js` extension
 (`import { AppModule } from './app.module.js'`) even though the source is `.ts`.
 
-## Running locally
+## Running it
 
-Everything — Postgres, Kafka, migrations and the service — starts with one command. Docker is
-the only prerequisite.
+Two ways, both driven by npm scripts. Prerequisites: Docker (with Compose) and Node.js 22.19 or
+newer. Install dependencies once, and create the local config:
 
 ```bash
-docker compose --profile app up -d --build
+npm ci
+cp .env.example .env
 ```
 
-That brings up the database, a Kafka broker, creates the topics, applies the migrations and
-starts the API on <http://localhost:3000>, with the treasury feed switched on. Watch it with
-`docker compose --profile app logs -f api`, and stop it with
-`docker compose --profile app down` (add `-v` to discard the data too).
+### Option A: everything in Docker
 
-Check it is up:
+The API, Postgres, Kafka, the topics, the migrations and two demo programs (`program-1`,
+10,000,000 USD; `program-2`, 5,000,000 EUR, published by a stand-in treasury).
 
-```bash
-curl localhost:3000/health/ready      # {"status":"ok"}
-```
+| Step | Command |
+| --- | --- |
+| Start (builds the image, waits until healthy) | `npm run stack:up` |
+| Get a bearer token | `TOKEN=$(npm run stack:token --silent)` |
+| Publish a treasury message | `npm run stack:treasury -- --program program-3 --limit 750000.00 --currency GBP` |
+| Follow the API's logs | `npm run stack:logs` |
+| Stop | `npm run stack:down` (`npm run stack:down -- -v` also deletes the data) |
 
-Every other endpoint needs a bearer token; mint one from inside the container:
+### Option B: the app on your machine, infrastructure in Docker
 
-```bash
-docker compose exec api npm run token
-```
+Hot reload, and `.env` for configuration.
 
-Then jump to [Calling the API](#calling-the-api). To publish a treasury message, run the same
-script in the container: `docker compose exec api npm run treasury -- --program program-1
---limit 2500000.00 --sequence 1`.
+| Step | Command |
+| --- | --- |
+| Start Postgres and Kafka, create the topics, apply the migrations | `npm run infra:up` |
+| Start the API with hot reload | `npm run start:dev` |
+| Open a program (programs only come from treasury) | `npm run treasury -- --program program-1 --limit 10000000.00 --currency USD` |
+| Get a bearer token | `TOKEN=$(npm run token --silent)` |
+| Stop the infrastructure | `npm run infra:down` |
 
-### Running it for development
+### Either way
 
-To work on the code, run only the infrastructure in Docker and the service on your machine.
-Requires Node.js 22.19 or newer.
+| What | Where |
+| --- | --- |
+| API | <http://localhost:3000> |
+| Health | <http://localhost:3000/health/ready> → `{"status":"ok"}` |
+| OpenAPI (Swagger UI) | <http://localhost:3000/docs>; **Authorize** with `$TOKEN`. JSON at `/docs/openapi.json` |
+| Kafka web UI (Redpanda Console) | <http://localhost:8080>; in option B start it with `npm run kafka:ui` |
+| Kafka over HTTP (used by Postman) | <http://localhost:18082> |
+| Postgres | `localhost:5433` (not 5432, to avoid a local Postgres; change `POSTGRES_PORT` and `DATABASE_URL` together) |
 
-```bash
-cp .env.example .env     # local settings; matches docker-compose.yml
-npm ci                   # also generates the Prisma client
-npm run db:up            # Postgres on 5433 and Kafka on 19092, waits until healthy
-npm run db:migrate       # apply migrations
-npm run start:dev        # http://localhost:3000, restarts on change
-```
+A token grants every scope on every program for one hour. To narrow it, add for example
+`-- --scope capacity:read --programs program-1`. The scopes are `capacity:read`,
+`reservations:write` and `repayments:write`.
 
-`npm run stack:up`, `stack:down` and `stack:logs` are shorthands for the Docker commands above.
+## Calling the API
 
-Postgres is published on **5433**, not 5432, so it does not collide with a Postgres already
-installed on the machine. To change it, set `POSTGRES_PORT` and both URLs in `.env` together.
-
-### Calling the API
-
-Every endpoint except `/health/*` needs a bearer token. Mint one for local use:
-
-```bash
-TOKEN=$(docker compose exec -T api npm run token --silent | tr -d '
-')   # Docker stack
-TOKEN=$(npm run token --silent)                                          # running it yourself
-```
-
-Either grants every scope on every program; `-- --scope capacity:read --programs program-1`
-narrows it. Then:
+Programs are opened by treasury (the Docker stack seeds `program-1`), so the API starts from
+reading one:
 
 ```bash
-# Open a program (admin)
-curl -X POST localhost:3000/programs -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json'   -d '{"programId":"program-1","creditLimit":{"amount":"10000000.00","currency":"USD"}}'
+# Current availability
+curl localhost:3000/programs/program-1/capacity -H "Authorization: Bearer $TOKEN"
 
-# Reserve capacity for an invoice — in another currency, converted at today's rate
-curl -X POST localhost:3000/programs/program-1/reservations -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json'   -d '{"invoiceId":"invoice-1","amount":{"amount":"100000.00","currency":"EUR"}}'
+# Reserve capacity for an invoice (EUR, converted into the program's USD)
+curl -X POST localhost:3000/programs/program-1/reservations -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"invoiceId":"invoice-1","invoiceAmount":{"amount":"100000.00","currency":"EUR"}}'
 
-# Record a partial repayment (omit "amount" to repay whatever is outstanding)
-curl -X POST localhost:3000/programs/program-1/reservations/invoice-1/repayments   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json'   -d '{"repaymentId":"repayment-1","amount":{"amount":"40000.00","currency":"EUR"}}'
+# Record a partial repayment (omit "amount" to repay everything outstanding)
+curl -X POST localhost:3000/programs/program-1/reservations/invoice-1/repayments \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"repaymentId":"repayment-1","amount":{"amount":"40000.00","currency":"EUR"}}'
 
 # Current availability, and the reservations behind it
 curl localhost:3000/programs/program-1/capacity -H "Authorization: Bearer $TOKEN"
 curl 'localhost:3000/programs/program-1/reservations?limit=20' -H "Authorization: Bearer $TOKEN"
 ```
 
-Amounts are always `{"amount": "<decimal string>", "currency": "<ISO 4217>"}` — strings, never
-JSON numbers, which cannot carry money exactly. Errors come back as RFC 9457
-`application/problem+json` with a stable `code`; the full list is in the
-[architecture document](docs/architecture.md#10-http-api).
+Amounts are always `{"amount": "<decimal string>", "currency": "<ISO 4217>"}` — strings, not
+JSON numbers. Errors are returned as RFC 9457 `application/problem+json` with a `code`; the full
+list is in the [architecture document](docs/architecture.md#37-http-api).
 
-### Postman collection
+**API documentation:** <http://localhost:3000/docs> (Swagger UI; use **Authorize** with a token)
+and <http://localhost:3000/docs/openapi.json>.
+
+## Postman collection
 
 [`docs/postman/invoice-reservation.postman_collection.json`](docs/postman/invoice-reservation.postman_collection.json)
-covers the whole API — 30 requests, each asserting what it expects, so **Run collection** in
-Postman exercises the service end to end and reports pass/fail.
+contains **39 requests** covering the whole service. Every request has tests asserting the
+expected status and body, so running the collection checks the service end to end — including
+the Kafka feed.
 
-Import the file and press Run; nothing else is needed. The collection mints its own bearer
-tokens from the `jwtSecret` variable, which matches the secret the Docker stack runs with, so
-there is no token to copy and paste. Point `baseUrl` at another environment and set
-`jwtSecret`, `jwtIssuer` and `jwtAudience` to match if you want to test one.
+| Folder | What it covers |
+| --- | --- |
+| 1. Health | liveness and readiness |
+| 2. Programs | treasury publishes a new program over Kafka; capacity once the feed has opened it; no HTTP endpoint for opening; unknown program |
+| 3. Reservations | same-currency and EUR reservations, repeats, insufficient capacity, invalid body, cursor paging |
+| 4. Repayments | partial and full repayment, repeated and reused repayment ids, overpayment, final capacity |
+| 5. Authentication and authorization | missing and tampered tokens, read-only token, reservations-only and repayments-only tokens, wrong program |
+| 6. Treasury updates | treasury raises the limit; a periodic reconciliation; treasury suspends the program (reservation refused) and reactivates it |
 
-Without installing Postman:
+**How to use it:**
+
+1. Start the service ([either way](#running-it)). Both expose what the collection needs:
+   the API on port 3000 and Kafka's HTTP proxy on port 18082.
+2. In Postman: **Import** → select the collection file.
+3. Open the collection and click **Run**.
+
+No setup is needed:
+
+- **Tokens are generated by the collection.** A collection-level pre-request script signs JWTs
+  with the `jwtSecret`, `jwtIssuer` and `jwtAudience` variables, which match the local config.
+  It creates several tokens (full access, read-only, reservations-only, repayments-only,
+  another program's, tampered) for the auth tests.
+- **The collection plays treasury itself.** Postman cannot speak Kafka, so the requests that
+  publish treasury messages go through Redpanda's HTTP proxy (`kafkaProxyUrl`,
+  `http://localhost:18082`) to the `treasuryTopic`. The request after each one polls the
+  capacity endpoint until the feed has applied the message.
+- **Each run publishes a new program** (`postman-<timestamp>`), so the collection can be run
+  repeatedly against the same database.
+- Ids created along the way (invoice, reservation, repayment, paging cursor) are stored in
+  collection variables and used by the following requests. Run the folders in order.
+
+To test another environment, change `baseUrl` and `kafkaProxyUrl`, and set `jwtSecret`,
+`jwtIssuer` and `jwtAudience` to that environment's values.
+
+**Without Postman**, run the same collection from the command line with Newman (the service must
+be running on `localhost:3000`, with the broker's HTTP proxy on `localhost:18082`):
 
 ```bash
-npm run test:api         # runs the same collection headlessly with Newman
+npm run test:api
 ```
 
-It covers the happy paths and the refusals side by side: idempotent opens and reservations,
-FX conversion, partial and full repayments, cursor paging, insufficient capacity, validation
-failures, and 401/403 for a missing, tampered, under-scoped or wrong-program token.
+## Acting as treasury
 
-### The treasury feed
-
-Treasury owns each program's credit limit and publishes changes over Kafka. It is already on
-in the Docker stack; running the service from your machine, it is off unless you ask for it:
+Programs are opened and changed only by treasury messages on Kafka. Locally, publish them with
+the `treasury` script (with the stack in Docker, use `npm run stack:treasury` instead):
 
 ```bash
-KAFKA_ENABLED=true npm run start:dev
-
-npm run treasury -- --program program-1 --limit 2500000.00 --sequence 1   # capacity change
-npm run treasury -- --program program-1 --limit 2500000.00 --sequence 2                     --reserved 125000.00                                  # bulk reconciliation
-npm run treasury -- --program program-1 --malformed                       # goes to dead letters
+npm run treasury -- --program program-3 --limit 750000.00 --currency GBP   # open, or change the limit
+npm run treasury -- --program program-3 --status SUSPENDED                 # or ACTIVE
+npm run treasury -- --program program-3 --limit 900000.00 --currency GBP --status ACTIVE --reconcile
+npm run treasury -- --program program-3 --malformed                        # lands in the dead-letter topic
 ```
 
-Two behaviours worth knowing, both deliberate and explained in
-[§13](docs/architecture.md#13-the-treasury-feed):
+Then check `GET /programs/program-3/capacity`. Alternatives: **Produce record** on the
+`treasury.program-capacity` topic in Redpanda Console (<http://localhost:8080>), or an HTTP
+POST to Kafka's proxy, as the Postman collection does:
 
-- **Treasury can cut a limit below what is already reserved.** Existing holds stand, the
-  program goes *over limit* (available capacity is negative), and new reservations are refused
-  until repayments bring it back under.
-- **Reconciliation never overwrites what we hold reserved.** A difference between treasury's
-  figure and ours is reported as a discrepancy, because ours is the one backed by per-invoice
-  reservations and an immutable ledger.
+```bash
+curl -X POST localhost:18082/topics/treasury.program-capacity \
+  -H 'Content-Type: application/vnd.kafka.json.v2+json' \
+  -d '{"records":[{"key":"program-5","value":{"eventId":"manual-2","eventType":"program.capacity.changed","occurredAt":"2026-09-21T10:00:00Z","sequence":1,"program":{"id":"program-5","creditLimit":{"amount":"100000.00","currency":"USD"}}}}]}'
+```
 
-Messages that can never succeed — not JSON, not the schema, an unknown program — are parked
-in the dead-letter topic with the reason, rather than blocking the feed:
+Read the dead-letter topic:
 
 ```bash
 docker compose exec redpanda rpk topic consume treasury.program-capacity.dead-letter --num 1
 ```
 
-### Tests
+Message format and processing rules: [architecture §3.8](docs/architecture.md#38-treasury-feed).
+
+## Events this service publishes
+
+Every change — program opened, capacity reserved or released, limit or status changed — is
+published to Kafka on `capacity.events`, keyed by program id, through a transactional outbox: an
+event is published if and only if its change committed. Delivery is at least once; each message
+has a stable `eventId`. Watch them in Redpanda Console, or:
 
 ```bash
-npm test                 # unit — pure, no infrastructure
-npm run test:int         # integration — real Postgres and Kafka; needs `npm run db:up`
-npm run test:e2e         # end to end — the whole app over HTTP; needs `npm run db:up`
+docker compose exec redpanda rpk topic consume capacity.events --offset start
 ```
 
-The integration and end-to-end suites run against a separate `capacity_test` database that
-is dropped and rebuilt from the migrations on every run. They refuse to start against any
-database whose name does not contain `test`, so they cannot be pointed at real data by
-mistake.
+Details and the message format: [architecture §3.11](docs/architecture.md#311-published-events-transactional-outbox).
+
+## Tests
+
+```bash
+npm test                 # unit — no infrastructure needed
+npm run test:int         # integration — real Postgres and Kafka in their own containers
+npm run test:e2e         # end to end — real Postgres and Kafka in their own containers, HTTP API
+npm run test:api         # Postman collection via Newman; needs a running service
+npm run typecheck        # type-check everything, tests included
+```
+
+The end-to-end tests run the whole service against a real Kafka broker: a stand-in treasury
+publishes programs and limit changes to a Kafka topic created for the test run, and the tests
+then drive reservations and repayments over HTTP.
+
+**Test containers.** `test:int` and `test:e2e` need only Docker running. Each run starts its own
+Postgres and Kafka (Redpanda) containers with [Testcontainers](https://testcontainers.com), on
+random ports, applies the migrations, runs the tests and removes the containers. They are
+separate from the `docker compose` stack, which can stay up or down. The container setup is in
+[`test/infrastructure/global-setup.ts`](test/infrastructure/global-setup.ts); the images match
+`docker-compose.yml`. The first run pulls the images, so it takes longer.
+
+Tests refuse to run against a database whose name does not contain `test`.
 
 ## Scripts
 
-| Script             | Purpose                        |
-| ------------------ | ------------------------------ |
-| `npm run start:dev`| Watch-mode dev server          |
-| `npm run build`    | Compile to `dist/`             |
-| `npm start`        | Run without watch              |
-| `npm test`         | Unit tests                     |
-| `npm run test:int` | Integration tests (real Postgres) |
-| `npm run test:cov` | Unit tests with coverage       |
-| `npm run test:e2e` | End-to-end tests over HTTP (real Postgres) |
+| Script | Purpose |
+| --- | --- |
+| `npm run start:dev` | Watch-mode dev server |
+| `npm run build` | Compile to `dist/` |
+| `npm start` | Run without watch |
+| `npm test` | Unit tests |
+| `npm run test:int` | Integration tests (real Postgres and Kafka) |
+| `npm run test:e2e` | End-to-end tests (real Kafka, HTTP API) |
+| `npm run test:cov` | Unit tests with coverage |
 | `npm run test:api` | Run the Postman collection against a running service |
-| `npm run token`    | Mint a local bearer token      |
-| `npm run treasury` | Publish a treasury message to the local feed |
-| `npm run stack:up` | Build and start the whole stack in Docker |
-| `npm run stack:down` | Stop it |
-| `npm run stack:logs` | Follow the service's logs |
-| `npm run lint`     | Lint `src/` and `test/`        |
-| `npm run typecheck`| Type-check everything, tests included |
-| `npm run format`   | Format with Prettier           |
-| `npm run db:up` / `db:down` | Start / stop Postgres |
+| `npm run token` | Mint a local bearer token |
+| `npm run treasury` | Publish a treasury message to the local feed (opens or updates a program) |
+| `npm run kafka:ui` | Start Redpanda Console (Kafka web UI) on port 8080 |
+| `npm run stack:up` / `stack:down` / `stack:logs` | Whole stack in Docker |
+| `npm run stack:token` / `stack:treasury` | `token` / `treasury`, run inside the Docker stack |
+| `npm run infra:up` / `infra:down` | Postgres and Kafka for local development (up also creates topics and migrates) |
 | `npm run db:migrate` | Apply migrations (`prisma migrate deploy`) |
 | `npm run db:migrate:dev` | Create a migration from schema changes |
 | `npm run db:generate` | Regenerate the Prisma client (also runs on install) |
+| `npm run lint` | Lint `src/`, `test/` and `scripts/` |
+| `npm run typecheck` | Type-check everything, tests included |
+| `npm run format` | Format with Prettier |
 
-## Architecture
+## Notes
 
-Domain-driven design, layered so the domain depends on nothing: presentation and
-infrastructure both point inward at the application layer, which points at the domain.
-Adapters implement ports the domain declares.
-
-See **[docs/architecture.md](docs/architecture.md)** for the full model, the reasoning, and
-the trade-offs behind each choice. In brief:
-
-| Decision | Chosen |
-| --- | --- |
-| Persistence | PostgreSQL + Prisma, explicit domain-to-row mappers |
-| Application layer | `@nestjs/cqrs` command and query buses |
-| Aggregates | `Program` and `Reservation` as separate roots, written in one transaction |
-| Concurrency | Pessimistic `SELECT … FOR UPDATE` on the program row, no I/O inside the lock |
-| Repayments | Partial or full, idempotent by the caller's `RepaymentId` |
-| Audit | Append-only capacity ledger alongside the counter — not event sourcing |
-| Currency | Convert on reservation, snapshot the rate, replay it on every repayment |
-| Rounding | `CEILING` to reserve, `FLOOR` on the running total to release, exact final settlement |
-| Safety net | `CHECK` constraints mirroring the domain invariants |
-| Auth | JWT bearer with a default-deny global guard |
-| Treasury feed | Full state per message, ordered by sequence, idempotent by event id |
-| Reconciliation | Reports a mismatch; never overwrites our reserved amount |
-
-Kafka ingestion from the treasury system is deferred; the seam it attaches to is described
-in §13 of the architecture document.
-
-## Notes and trade-offs
-
-- **Run `npm run typecheck` as well as the tests.** `nest build` excludes spec files and
-  Vitest strips types without checking them, so a type error in a test would otherwise pass
-  unnoticed.
-
-- **Use `npm ci`, not a from-scratch `npm install`.** npm 10.9.3 (bundled with Node 22.19)
-  hits an `arborist` bug — `Cannot read properties of null (reading 'edgesOut')` — while
-  resolving Vitest 4's peer graph from scratch. Installing against the committed
-  `package-lock.json` avoids re-resolution and works normally. If the lockfile ever has to
-  be regenerated on this npm version, use `npm install --legacy-peer-deps`; upgrading to
-  npm 11 removes the need for the flag.
-- `@nestjs/mau` (the optional Nest deploy CLI) was removed from the scaffold. It was the
-  sole source of the 5 advisories the scaffold shipped with.
-- **Prisma is pinned to exactly 7.10.0**, CLI and client together. At the time of writing
-  the CLI's `latest` npm tag pointed at an 8.0 release candidate while the client's pointed
-  at 7.10; an unpinned install would have mixed a pre-release CLI with a stable client.
-- **Accepted audit findings.** `npm audit` reports 4 high-severity advisories, all inside
-  the `prisma` CLI: `mysql2` (bundled for MySQL support) and `deepmerge-ts` (used by the
-  CLI's config loader). `@prisma/client` declares the CLI as an optional peer, so it is
-  installed even with `--omit=dev` — "dev-only" is not the argument. Reachability is:
-  `mysql2` only runs when connecting to MySQL, which this service never does, and
-  `deepmerge-ts`' stack exhaustion needs a recursive object graph, while the CLI only ever
-  merges our own trusted config file. Neither is reachable from a request to the service.
-  The suggested fix, downgrading to Prisma 6, would be the worse trade. Revisit on each
-  Prisma upgrade.
-- **Hand-written SQL in migrations.** Prisma's schema language cannot express `CHECK`
-  constraints or triggers, so the invariants the database repeats as a last line of
-  defence — and the ledger's append-only trigger — are written by hand at the end of the
-  migration. Partial unique indexes *are* in the schema (Prisma's `partialIndexes` preview
-  feature), so `migrate dev` will not try to drop them.
+- Run `npm run typecheck` as well as the tests: `nest build` skips spec files and Vitest does not
+  check types.
+- Install with `npm ci`. To regenerate the lockfile on npm 10, use
+  `npm install --legacy-peer-deps`.
+- Prisma is pinned to exactly 7.10.0, CLI and client together.

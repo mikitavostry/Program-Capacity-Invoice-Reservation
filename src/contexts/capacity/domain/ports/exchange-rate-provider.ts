@@ -4,12 +4,8 @@ import type { ExchangeRate } from '../../../../shared/money/exchange-rate.js';
 
 export interface ExchangeRateProvider {
   /**
-   * The rate for converting `from` into `to` now.
-   *
-   * Always called before a transaction opens, never inside one: it may be a network call,
-   * and a program's row is locked for the whole transaction.
-   *
-   * Rejects with `ExchangeRateUnavailableError` when no rate is known for the pair.
+   * The current `from` → `to` rate. May be a network call, so never call it inside a
+   * transaction. Rejects with `ExchangeRateUnavailableError` for an unknown pair.
    */
   rateFor(from: Currency, to: Currency): Promise<ExchangeRate>;
 }

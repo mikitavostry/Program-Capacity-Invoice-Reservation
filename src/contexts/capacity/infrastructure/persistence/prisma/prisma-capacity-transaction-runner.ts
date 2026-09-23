@@ -6,6 +6,7 @@ import {
 } from '../../../domain/ports/capacity-transaction-runner.js';
 import { isLockNotAvailable } from './postgres-errors.js';
 import { PrismaCapacityLedger } from './prisma-capacity-ledger.js';
+import { PrismaEventOutbox } from './prisma-event-outbox.js';
 import { PrismaProgramRepository } from './prisma-program-repository.js';
 import { PrismaReservationRepository } from './prisma-reservation-repository.js';
 import { PrismaTreasuryEventLog } from './prisma-treasury-event-log.js';
@@ -13,19 +14,12 @@ import { PrismaTreasuryEventLog } from './prisma-treasury-event-log.js';
 export interface TransactionSettings {
   /** How long to wait for a program's row lock before giving up with `CapacityBusyError`. */
   readonly lockTimeoutMs: number;
-  /** Ceiling on any single statement. */
   readonly statementTimeoutMs: number;
-  /** Ceiling on the whole transaction, enforced by Prisma on the application side. */
   readonly transactionTimeoutMs: number;
-  /** How long to wait for a pooled connection to start the transaction on. */
   readonly maxWaitMs: number;
 }
 
-/**
- * The lock wait is deliberately the shortest of these. A waiter that cannot get the lock
- * should give up and report a retryable error well before it could exhaust the connection
- * pool or run into the transaction ceiling. See docs/architecture.md §6.
- */
+/** The lock wait is the shortest, so a waiter gives up (retryably) before anything else does. */
 export const DEFAULT_TRANSACTION_SETTINGS: TransactionSettings = {
   lockTimeoutMs: 3_000,
   statementTimeoutMs: 5_000,
@@ -45,9 +39,8 @@ export class PrismaCapacityTransactionRunner implements CapacityTransactionRunne
     try {
       return await this.prisma.$transaction(
         async (tx) => {
-          // Scoped to this transaction only (the `true`), so a pooled connection never carries
-          // one caller's limits into another's. The idle timeout frees a lock if this process
-          // stalls mid-transaction while its connection stays open.
+          // `true` scopes these to this transaction, not the pooled connection. The idle timeout
+          // releases the locks if this process stalls mid-transaction.
           await tx.$queryRaw`
             SELECT set_config('lock_timeout', ${`${lockTimeoutMs}ms`}, true),
                    set_config('statement_timeout', ${`${statementTimeoutMs}ms`}, true),
@@ -58,11 +51,11 @@ export class PrismaCapacityTransactionRunner implements CapacityTransactionRunne
             reservations: new PrismaReservationRepository(tx),
             ledger: new PrismaCapacityLedger(tx),
             treasuryEvents: new PrismaTreasuryEventLog(tx),
+            outbox: new PrismaEventOutbox(tx),
           });
         },
         {
-          // Postgres's default, stated so nobody has to wonder. The row lock, not the isolation
-          // level, is what serialises writers to a program.
+          // The row lock, not the isolation level, serialises writers to a program.
           isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
           maxWait: maxWaitMs,
           timeout: transactionTimeoutMs,

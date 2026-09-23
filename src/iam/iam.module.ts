@@ -3,10 +3,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { AuthenticationGuard, AuthorizationGuard } from './guards.js';
 import { TokenVerifier } from './token-verifier.js';
 
-/**
- * Global guards run in the order they are registered: authentication first, so authorization
- * always has a principal to reason about.
- */
+/** Global guards run in registration order: authentication, then authorization. */
 @Module({
   providers: [
     TokenVerifier,

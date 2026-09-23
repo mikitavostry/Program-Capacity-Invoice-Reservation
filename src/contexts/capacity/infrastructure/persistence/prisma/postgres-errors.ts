@@ -10,21 +10,14 @@ const NESTED_KEYS = ['cause', 'meta', 'driverAdapterError'] as const;
 const MAX_DEPTH = 6;
 
 /**
- * Whether an error, however Prisma and the driver adapter have wrapped it, was Postgres
- * refusing to wait any longer for a lock.
- *
- * The SQLSTATE travels inside Prisma's error rather than on it. With Prisma 7.10 and
- * `@prisma/adapter-pg` it arrives as a `P2010` whose code sits at
- * `meta.driverAdapterError.cause.originalCode` — observed, not assumed, and pinned by
- * `postgres-errors.spec.ts`. The search walks the usual wrapping keys rather than hard-coding
- * that one path, so a minor re-nesting in a future release still matches; matching on the
- * code rather than message text keeps a reworded message from breaking it.
+ * Whether Postgres gave up waiting for a lock, however Prisma wrapped the error. With Prisma
+ * 7.10 and `@prisma/adapter-pg` the SQLSTATE sits at `meta.driverAdapterError.cause.originalCode`
+ * (pinned by `postgres-errors.spec.ts`); walking the wrapping keys survives a re-nesting.
  */
 export function isLockNotAvailable(error: unknown): boolean {
   return carriesCode(error, LOCK_NOT_AVAILABLE, new Set(), 0);
 }
 
-/** Whether an error was a unique constraint refusing a duplicate, by either route it arrives. */
 export function isUniqueViolation(error: unknown): boolean {
   return (
     carriesCode(error, PRISMA_UNIQUE_VIOLATION, new Set(), 0) ||

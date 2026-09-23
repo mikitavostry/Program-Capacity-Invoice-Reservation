@@ -1,4 +1,3 @@
-import type { EventBus } from '@nestjs/cqrs';
 import type {
   CapacityReadModel,
   ReservationListRequest,
@@ -11,11 +10,11 @@ import {
 } from '../../src/contexts/capacity/application/views.js';
 import { ProgramAlreadyExistsError } from '../../src/contexts/capacity/domain/errors.js';
 import {
-  CapacityDiscrepancyDetected,
   CapacityReleased,
   CapacityReserved,
   CreditLimitChanged,
   ProgramOpened,
+  ProgramStatusChanged,
 } from '../../src/contexts/capacity/domain/events.js';
 import type {
   InvoiceId,
@@ -50,18 +49,16 @@ import { InvariantViolationError } from '../../src/shared/domain/invariant-viola
 type Movement = CapacityReserved | CapacityReleased;
 
 /**
- * In-memory stand-ins for the persistence ports, for testing handlers without a database.
- *
- * They are faithful where it matters: state is stored as snapshots and rehydrated on every
- * read, so an aggregate changed but not saved is lost exactly as it would be in Postgres;
- * transactions roll back on throw; and they run one at a time, as writers to one program do
- * under its row lock. The real concurrency behaviour is covered by the integration suite.
+ * In-memory persistence ports for handler tests. State is stored as snapshots, so an unsaved
+ * change is lost as in Postgres; transactions roll back on throw and run one at a time.
  */
 export class InMemoryCapacity {
   readonly programs = new Map<string, ProgramSnapshot>();
   readonly reservations = new Map<string, ReservationSnapshot>();
   readonly movements: Movement[] = [];
   readonly treasuryEvents: TreasuryEventRecord[] = [];
+  /** The domain events written to the outbox. */
+  readonly outbox: DomainEvent[] = [];
 
   /** How many transactions are open right now — lets a test prove nothing slow runs in one. */
   openTransactions = 0;
@@ -102,6 +99,7 @@ class InMemoryTransactionRunner implements CapacityTransactionRunner {
       reservations: new Map(store.reservations),
       movements: [...store.movements],
       treasuryEvents: [...store.treasuryEvents],
+      outbox: [...store.outbox],
     };
 
     store.openTransactions += 1;
@@ -111,6 +109,7 @@ class InMemoryTransactionRunner implements CapacityTransactionRunner {
         reservations: new InMemoryReservationRepository(store),
         ledger: new InMemoryLedger(store),
         treasuryEvents: new InMemoryTreasuryEventLog(store),
+        outbox: { add: async (events) => void store.outbox.push(...events) },
       });
       store.commits += 1;
       return result;
@@ -119,6 +118,7 @@ class InMemoryTransactionRunner implements CapacityTransactionRunner {
       replace(store.reservations, before.reservations);
       store.movements.splice(0, store.movements.length, ...before.movements);
       store.treasuryEvents.splice(0, store.treasuryEvents.length, ...before.treasuryEvents);
+      store.outbox.splice(0, store.outbox.length, ...before.outbox);
       throw error;
     } finally {
       store.openTransactions -= 1;
@@ -195,7 +195,7 @@ class InMemoryLedger implements CapacityLedger {
       if (
         event instanceof ProgramOpened ||
         event instanceof CreditLimitChanged ||
-        event instanceof CapacityDiscrepancyDetected
+        event instanceof ProgramStatusChanged
       ) {
         continue;
       }
@@ -284,19 +284,6 @@ function isAfter(
 function replace<K, V>(target: Map<K, V>, source: Map<K, V>): void {
   target.clear();
   for (const [key, value] of source) target.set(key, value);
-}
-
-/** Captures published events instead of dispatching them. */
-export class RecordingEventBus {
-  readonly published: DomainEvent[] = [];
-
-  publishAll(events: DomainEvent[]): void {
-    this.published.push(...events);
-  }
-
-  asEventBus(): EventBus {
-    return this as unknown as EventBus;
-  }
 }
 
 /** A clock that only moves when told to. */

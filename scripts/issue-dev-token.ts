@@ -24,7 +24,7 @@ const { values } = parseArgs({
     subject: { type: 'string', default: 'local-developer' },
     scope: {
       type: 'string',
-      default: 'capacity:read capacity:write programs:admin',
+      default: 'capacity:read reservations:write repayments:write',
     },
     programs: { type: 'string', default: '*' },
     ttl: { type: 'string', default: '3600' },

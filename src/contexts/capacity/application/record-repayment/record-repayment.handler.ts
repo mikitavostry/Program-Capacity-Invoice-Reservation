@@ -1,7 +1,6 @@
 import { Inject } from '@nestjs/common';
-import { CommandHandler, EventBus, type ICommandHandler } from '@nestjs/cqrs';
+import { CommandHandler, type ICommandHandler } from '@nestjs/cqrs';
 import { CLOCK, type Clock } from '../../../../shared/application/clock.js';
-import type { DomainEvent } from '../../../../shared/domain/domain-event.js';
 import { InvariantViolationError } from '../../../../shared/domain/invariant-violation-error.js';
 import type { Money } from '../../../../shared/money/money.js';
 import type { RecordedRepayment } from '../../domain/ports/capacity-ledger.js';
@@ -24,7 +23,6 @@ interface Outcome {
   readonly repaidAmount: Money;
   readonly releasedAmount: Money;
   readonly replayed: boolean;
-  readonly events: DomainEvent[];
 }
 
 @CommandHandler(RecordRepaymentCommand)
@@ -32,7 +30,6 @@ export class RecordRepaymentHandler implements ICommandHandler<RecordRepaymentCo
   constructor(
     @Inject(CAPACITY_TRANSACTION_RUNNER) private readonly transactions: CapacityTransactionRunner,
     @Inject(CLOCK) private readonly clock: Clock,
-    private readonly events: EventBus,
   ) {}
 
   async execute(command: RecordRepaymentCommand): Promise<RecordRepaymentResult> {
@@ -40,7 +37,7 @@ export class RecordRepaymentHandler implements ICommandHandler<RecordRepaymentCo
       const program = await uow.programs.lockById(command.programId);
       if (program === null) throw new ProgramNotFoundError(command.programId);
 
-      // Checked under the program lock, so two deliveries of one repayment cannot both miss it.
+      // Under the program lock, so two deliveries of one repayment cannot both miss it.
       const recorded = await uow.ledger.findRepayment(command.programId, command.repaymentId);
       if (recorded !== null) return replayOf(recorded, command, uow);
 
@@ -63,11 +60,10 @@ export class RecordRepaymentHandler implements ICommandHandler<RecordRepaymentCo
       await uow.reservations.save(reservation);
       const events = program.pullDomainEvents();
       await uow.ledger.record(events);
+      await uow.outbox.add(events);
 
-      return { reservation, repaidAmount, releasedAmount, replayed: false, events };
+      return { reservation, repaidAmount, releasedAmount, replayed: false };
     });
-
-    this.events.publishAll(outcome.events);
 
     return {
       repaymentId: command.repaymentId.value,
@@ -80,10 +76,8 @@ export class RecordRepaymentHandler implements ICommandHandler<RecordRepaymentCo
 }
 
 /**
- * Answers a repayment id that has already been applied with what it did the first time.
- *
- * It must be the same repayment: same invoice, and the same amount — or no amount, which
- * means "whatever was outstanding" and matches whatever that turned out to be.
+ * A repayment id already applied returns its original result, if it is the same repayment:
+ * same invoice, and the same amount or none ("whatever was outstanding").
  */
 async function replayOf(
   recorded: RecordedRepayment,
@@ -106,6 +100,5 @@ async function replayOf(
     repaidAmount: recorded.repaidAmount,
     releasedAmount: recorded.releasedAmount,
     replayed: true,
-    events: [],
   };
 }

@@ -1,9 +1,5 @@
 import { Identifier } from './identifier.js';
 
-/**
- * An entity is defined by its identity rather than its attributes: two instances are the
- * same entity when their ids match, however much the rest of their state differs.
- */
 export abstract class Entity<TId extends Identifier> {
   readonly id: TId;
 

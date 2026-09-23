@@ -5,7 +5,7 @@ import type { ReservationView } from '../views.js';
 
 export interface ReserveCapacityResult {
   readonly reservation: ReservationView;
-  /** `false` when this repeated a request the invoice's active reservation already answers. */
+  /** `false` when the invoice already held this reservation. */
   readonly created: boolean;
 }
 

@@ -1,60 +1,75 @@
 import { z } from 'zod';
 import { Currency } from '../../../../shared/money/currency.js';
-import { Money } from '../../../../shared/money/money.js';
-import {
-  ApplyTreasuryUpdateCommand,
-  type ApplyTreasuryUpdateResult,
-} from '../../application/apply-treasury-update/apply-treasury-update.command.js';
+import { DomainError } from '../../../../shared/domain/domain-error.js';
+import { MAX_MINOR_UNITS, Money } from '../../../../shared/money/money.js';
+import { ApplyTreasuryUpdateCommand } from '../../application/apply-treasury-update/apply-treasury-update.command.js';
 import { ProgramId } from '../../domain/ids.js';
+import { PROGRAM_STATUSES } from '../../domain/program.js';
 import type { TreasuryEventKind } from '../../domain/ports/treasury-event-log.js';
-
-/*
- * The anti-corruption layer for the treasury feed.
- *
- * Treasury's wire format is theirs, and deliberately not ours: their field names, their
- * envelope, their event type strings. This module is the single place that knows about it, so
- * a change at their end is a change here and nowhere else. What leaves this file is a command
- * in our own language, holding our own value objects.
- */
 
 const money = z
   .object({ amount: z.string(), currency: z.string() })
   .strict()
   .transform((value, ctx): Money => {
+    let amount: Money;
     try {
-      return Money.fromDecimal(value.amount, Currency.of(value.currency));
+      amount = Money.fromDecimal(value.amount, Currency.of(value.currency));
     } catch (error) {
       ctx.addIssue({ code: 'custom', message: (error as Error).message });
       return z.NEVER;
     }
+    if (amount.minorUnits > MAX_MINOR_UNITS || -amount.minorUnits > MAX_MINOR_UNITS) {
+      ctx.addIssue({ code: 'custom', message: 'is too large to store' });
+      return z.NEVER;
+    }
+    return amount;
   });
 
-/** Treasury's event type strings, mapped to what they mean here. */
-const EVENT_KINDS: Readonly<Record<string, TreasuryEventKind>> = {
+// Postgres rejects NUL in text and jsonb, which would fail the write on every redelivery.
+const noNul = (value: string) => !value.includes('\u0000');
+
+const EVENT_KINDS = {
   'program.capacity.changed': 'CAPACITY_CHANGED',
+  'program.status.changed': 'STATUS_CHANGED',
   'program.state.reconciled': 'STATE_RECONCILED',
-};
+} as const satisfies Record<string, TreasuryEventKind>;
 
-const treasuryMessageSchema = z.object({
-  eventId: z.string().min(1).max(200),
-  eventType: z.enum(Object.keys(EVENT_KINDS) as [string, ...string[]]),
+const envelope = {
+  eventId: z.string().min(1).max(200).refine(noNul, 'must not contain NUL characters'),
   occurredAt: z.iso.datetime({ offset: true }),
-  /** Strictly increasing per program at the source; how we order and de-duplicate. */
+  /** Strictly increasing per program across all event types. */
   sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-  program: z
-    .object({
-      id: z.string().min(1).max(128),
-      creditLimit: money,
-      /**
-       * Only bulk reconciliation carries treasury's view of what is reserved; an incremental
-       * capacity change does not claim to know it.
-       */
-      reservedAmount: money.optional(),
-    })
-    .strict(),
-});
+};
+const programId = z
+  .string()
+  .trim()
+  .min(1)
+  .max(128)
+  .refine(noNul, 'must not contain NUL characters');
+const status = z.enum(PROGRAM_STATUSES);
 
-export type TreasuryMessage = z.output<typeof treasuryMessageSchema>;
+/*
+ * A capacity change carries the limit, a status change the status, and a reconciliation both:
+ * the program's full treasury-owned state, correcting anything an earlier message missed.
+ * Unknown fields are rejected.
+ */
+const treasuryMessageSchema = z.discriminatedUnion('eventType', [
+  z.object({
+    ...envelope,
+    eventType: z.literal('program.capacity.changed'),
+    program: z.object({ id: programId, creditLimit: money }).strict(),
+  }),
+  z.object({
+    ...envelope,
+    eventType: z.literal('program.status.changed'),
+    program: z.object({ id: programId, status }).strict(),
+  }),
+  z.object({
+    ...envelope,
+    eventType: z.literal('program.state.reconciled'),
+    program: z.object({ id: programId, creditLimit: money, status }).strict(),
+  }),
+]);
 
 export class TreasuryMessageError extends Error {
   constructor(
@@ -66,12 +81,7 @@ export class TreasuryMessageError extends Error {
   }
 }
 
-/**
- * Turns raw message bytes into a command, or rejects them.
- *
- * Anything this throws on can never succeed by being retried — the bytes will not change — so
- * the consumer parks it in the dead-letter topic rather than blocking the partition behind it.
- */
+/** Parses message bytes into a command. Throws only `TreasuryMessageError`, which is permanent. */
 export function toCommand(raw: Buffer | string | null): ApplyTreasuryUpdateCommand {
   if (raw === null) {
     throw new TreasuryMessageError('The message has no body.');
@@ -93,18 +103,21 @@ export function toCommand(raw: Buffer | string | null): ApplyTreasuryUpdateComma
   }
 
   const message = parsed.data;
-  const kind = EVENT_KINDS[message.eventType] as TreasuryEventKind;
+  const { program } = message;
 
-  return new ApplyTreasuryUpdateCommand(
-    ProgramId.of(message.program.id),
-    message.eventId,
-    kind,
-    message.sequence,
-    message.program.creditLimit,
-    message.program.reservedAmount ?? null,
-    new Date(message.occurredAt),
-    json,
-  );
+  try {
+    return new ApplyTreasuryUpdateCommand(
+      ProgramId.of(program.id),
+      message.eventId,
+      EVENT_KINDS[message.eventType],
+      message.sequence,
+      'creditLimit' in program ? program.creditLimit : null,
+      new Date(message.occurredAt),
+      json,
+      'status' in program ? program.status : null,
+    );
+  } catch (error) {
+    if (error instanceof DomainError) throw new TreasuryMessageError(error.message);
+    throw error;
+  }
 }
-
-export type { ApplyTreasuryUpdateResult };

@@ -6,19 +6,15 @@ import {
 } from '../../domain/ports/exchange-rate-provider.js';
 
 export interface StaticRateTable {
-  /** When these rates were observed; recorded on every reservation that uses one. */
+  /** When the rates were observed; stored with each reservation that uses one. */
   readonly asOf: Date;
   /** Keyed `"FROM/TO"`, e.g. `{ "EUR/USD": "1.09" }`, each rate a decimal string. */
   readonly rates: Readonly<Record<string, string>>;
 }
 
 /**
- * Rates from a fixed table — a stand-in for a real market-data or treasury rate service,
- * which would implement the same port.
- *
- * Only pairs that are listed are available. The inverse of a listed rate is deliberately not
- * derived: inverting at eight decimal places is itself a rounding, producing a rate nobody
- * quoted, and a reservation would then record a rate no one could trace back to a source.
+ * Rates from a fixed table, standing in for a market-data service behind the same port. Only
+ * listed pairs exist: an inverse is not derived, since it would be a rate nobody quoted.
  */
 export class StaticExchangeRateProvider implements ExchangeRateProvider {
   readonly #asOf: Date;

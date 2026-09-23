@@ -29,8 +29,7 @@ export class PrismaReservationRepository implements ReservationRepository {
   }
 
   async save(reservation: Reservation): Promise<void> {
-    // Only what a repayment can change. Everything else about a reservation is fixed at
-    // creation, and writing it back would invite a bug to rewrite history.
+    // Only what a repayment changes; the rest is fixed at creation.
     await this.tx.reservation.update({
       where: { id: reservation.id.value },
       data: {

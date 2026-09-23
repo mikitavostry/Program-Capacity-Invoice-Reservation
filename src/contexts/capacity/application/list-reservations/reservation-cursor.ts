@@ -1,9 +1,8 @@
 import type { ReservationCursor } from '../ports/capacity-read-model.js';
 
 /*
- * Cursors are opaque to callers: an encoded (reservedAt, reservationId) pair. A keyset
- * cursor rather than an offset, so a page stays stable while new reservations arrive — an
- * offset would shift under the reader and skip or repeat rows.
+ * An opaque keyset cursor: base64url of (reservedAt, reservationId). Unlike an offset, it does
+ * not skip or repeat rows while new reservations arrive.
  */
 
 export function encodeReservationCursor(cursor: ReservationCursor): string {
@@ -13,7 +12,6 @@ export function encodeReservationCursor(cursor: ReservationCursor): string {
   ).toString('base64url');
 }
 
-/** Returns `null` for anything that is not a cursor this service issued. */
 export function decodeReservationCursor(encoded: string): ReservationCursor | null {
   let parsed: unknown;
   try {

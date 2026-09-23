@@ -1,30 +1,22 @@
 import { DomainError } from '../../../../shared/domain/domain-error.js';
 import type { ProgramId } from '../ids.js';
 
-export type TreasuryEventKind = 'CAPACITY_CHANGED' | 'STATE_RECONCILED';
+export type TreasuryEventKind = 'CAPACITY_CHANGED' | 'STATUS_CHANGED' | 'STATE_RECONCILED';
 
 export interface TreasuryEventRecord {
   readonly programId: ProgramId;
-  /** The producer's id for the message; the deduplication key. */
+  /** Treasury's id for the message; the deduplication key. */
   readonly eventId: string;
   readonly kind: TreasuryEventKind;
   readonly sequence: number;
-  /** Whether it changed anything. A message older than our state is recorded and ignored. */
+  /** `false` for a stale message, with the `reason`. */
   readonly applied: boolean;
-  /** Why it was not applied, when it was not. */
   readonly reason: string | null;
-  /** The message as received, so a decision can be re-examined against what actually arrived. */
   readonly payload: unknown;
   readonly occurredAt: Date;
 }
 
-/**
- * Every treasury message this service has accepted: the deduplication key and the audit
- * trail for capacity changes the service did not decide for itself.
- *
- * Written in the same transaction as the change it caused, so a message cannot be recorded
- * as applied unless its effect committed too.
- */
+/** Every treasury message accepted, written with its effect: deduplication and audit trail. */
 export interface TreasuryEventLog {
   /** Rejects with `TreasuryEventAlreadyRecordedError` if this event id was recorded before. */
   record(entry: TreasuryEventRecord): Promise<void>;

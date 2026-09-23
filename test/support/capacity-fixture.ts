@@ -1,14 +1,16 @@
 import { ApplyTreasuryUpdateHandler } from '../../src/contexts/capacity/application/apply-treasury-update/apply-treasury-update.handler.js';
 import { GetProgramCapacityHandler } from '../../src/contexts/capacity/application/get-program-capacity/get-program-capacity.handler.js';
 import { ListReservationsHandler } from '../../src/contexts/capacity/application/list-reservations/list-reservations.handler.js';
-import { OpenProgramHandler } from '../../src/contexts/capacity/application/open-program/open-program.handler.js';
 import { RecordRepaymentHandler } from '../../src/contexts/capacity/application/record-repayment/record-repayment.handler.js';
 import { ReserveCapacityHandler } from '../../src/contexts/capacity/application/reserve-capacity/reserve-capacity.handler.js';
+import type { ProgramId } from '../../src/contexts/capacity/domain/ids.js';
 import type { ExchangeRateProvider } from '../../src/contexts/capacity/domain/ports/exchange-rate-provider.js';
 import { StaticExchangeRateProvider } from '../../src/contexts/capacity/infrastructure/fx/static-exchange-rate-provider.js';
 import type { Currency } from '../../src/shared/money/currency.js';
 import type { ExchangeRate } from '../../src/shared/money/exchange-rate.js';
-import { FixedClock, InMemoryCapacity, RecordingEventBus } from './in-memory-capacity.js';
+import type { Money } from '../../src/shared/money/money.js';
+import { FixedClock, InMemoryCapacity } from './in-memory-capacity.js';
+import { openingMessage } from './treasury-commands.js';
 
 export const FIXTURE_START = new Date('2026-09-19T09:00:00.000Z');
 export const RATES_AS_OF = new Date('2026-09-19T08:00:00.000Z');
@@ -35,7 +37,6 @@ export class ObservedRates implements ExchangeRateProvider {
 /** Real handlers over in-memory ports. */
 export function capacityFixture() {
   const store = new InMemoryCapacity();
-  const events = new RecordingEventBus();
   const clock = new FixedClock(FIXTURE_START);
   const rates = new ObservedRates(
     new StaticExchangeRateProvider({
@@ -44,17 +45,18 @@ export function capacityFixture() {
     }),
     store,
   );
-  const bus = events.asEventBus();
+  const applyTreasury = new ApplyTreasuryUpdateHandler(store.transactions);
 
   return {
     store,
-    events,
     clock,
     rates,
-    openProgram: new OpenProgramHandler(store.transactions, store.readModel, clock, bus),
-    reserve: new ReserveCapacityHandler(store.transactions, store.readModel, rates, clock, bus),
-    repay: new RecordRepaymentHandler(store.transactions, clock, bus),
-    applyTreasury: new ApplyTreasuryUpdateHandler(store.transactions, bus),
+    /** Opens a program the way production does: from its first treasury message. */
+    openProgram: (programId: ProgramId, creditLimit: Money) =>
+      applyTreasury.execute(openingMessage(programId, creditLimit)),
+    reserve: new ReserveCapacityHandler(store.transactions, store.readModel, rates, clock),
+    repay: new RecordRepaymentHandler(store.transactions, clock),
+    applyTreasury,
     getCapacity: new GetProgramCapacityHandler(store.readModel),
     listReservations: new ListReservationsHandler(store.readModel),
   };

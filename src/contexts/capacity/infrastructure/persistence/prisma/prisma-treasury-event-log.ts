@@ -19,8 +19,6 @@ export class PrismaTreasuryEventLog implements TreasuryEventLog {
           sequence: BigInt(entry.sequence),
           applied: entry.applied,
           reason: entry.reason,
-          // Stored as received. A decision about capacity should be answerable against the
-          // message that caused it, not a reconstruction of it.
           payload: entry.payload as Prisma.InputJsonValue,
           occurredAt: entry.occurredAt,
         },

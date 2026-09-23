@@ -26,7 +26,7 @@ export class ReservationsController {
 
   /** 201 for a new reservation; 200 when this repeats one the invoice already holds. */
   @Post()
-  @RequireScopes(Scopes.CapacityWrite)
+  @RequireScopes(Scopes.ReservationsWrite)
   async reserve(
     @Param('programId', new ZodPipe(identifier, 'path')) programId: string,
     @Body(new ZodPipe(reserveCapacityBody, 'body')) body: z.output<typeof reserveCapacityBody>,
@@ -36,7 +36,7 @@ export class ReservationsController {
       new ReserveCapacityCommand(
         ProgramId.of(programId),
         InvoiceId.of(body.invoiceId),
-        body.amount,
+        body.invoiceAmount,
       ),
     );
 
@@ -62,12 +62,9 @@ export class ReservationsController {
     return presentReservationPage(page);
   }
 
-  /**
-   * A repayment is a record created, not the reservation deleted — hence POST to a
-   * sub-resource. 201 when applied; 200 when this repayment id was already applied.
-   */
+  /** 201 when applied; 200 when this repayment id was already applied. */
   @Post(':invoiceId/repayments')
-  @RequireScopes(Scopes.CapacityWrite)
+  @RequireScopes(Scopes.RepaymentsWrite)
   async repay(
     @Param('programId', new ZodPipe(identifier, 'path')) programId: string,
     @Param('invoiceId', new ZodPipe(identifier, 'path')) invoiceId: string,

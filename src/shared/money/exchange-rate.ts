@@ -27,11 +27,8 @@ export class RateNotApplicableError extends DomainError {
 }
 
 /**
- * The rate between two currencies at a known moment.
- *
- * The observation time is part of the value, not decoration. A reservation stores the rate
- * it used so the release can replay it, and a rate without a timestamp cannot be explained
- * or audited after the fact.
+ * A rate between two currencies and when it was observed. A reservation stores the rate it
+ * used, so its releases convert at the same rate and the conversion can be audited later.
  */
 export class ExchangeRate extends ValueObject {
   readonly from: Currency;
@@ -73,7 +70,6 @@ export class ExchangeRate extends ValueObject {
     return new ExchangeRate(from, to, parsed.scaled, asOf.getTime());
   }
 
-  /** The rate a currency has against itself. Converting through it changes nothing. */
   static identity(currency: Currency, asOf: Date): ExchangeRate {
     return ExchangeRate.of(currency, currency, '1', asOf);
   }
@@ -86,13 +82,7 @@ export class ExchangeRate extends ValueObject {
     return formatScaledDecimal(this.scaledRate, RATE_DECIMAL_PLACES);
   }
 
-  /**
-   * Converts an amount in `from` into `to`.
-   *
-   * The whole calculation is one integer division, so the two currencies' differing minor
-   * units and the rate's own scale are resolved together and rounding happens exactly once,
-   * at the end. Rounding up by default: see `RoundingMode`.
-   */
+  /** Converts into `to` with a single integer division, so it rounds exactly once. */
   convert(amount: Money, mode: RoundingMode = 'CEILING'): Money {
     if (!amount.currency.equals(this.from)) {
       throw new RateNotApplicableError(this.from, this.to, amount.currency);

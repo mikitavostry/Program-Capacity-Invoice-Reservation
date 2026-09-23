@@ -1,37 +1,17 @@
-import { Body, Controller, Get, HttpStatus, Param, Post, Res } from '@nestjs/common';
-import { CommandBus, QueryBus } from '@nestjs/cqrs';
-import type { Response } from 'express';
-import type { z } from 'zod';
+import { Controller, Get, Param } from '@nestjs/common';
+import { QueryBus } from '@nestjs/cqrs';
 import { RequireScopes } from '../../../../iam/decorators.js';
 import { Scopes } from '../../../../iam/principal.js';
 import { ZodPipe } from '../../../../platform/http/request-validation.js';
 import { GetProgramCapacityQuery } from '../../application/get-program-capacity/get-program-capacity.query.js';
-import { OpenProgramCommand } from '../../application/open-program/open-program.command.js';
 import { ProgramId } from '../../domain/ids.js';
 import { presentProgram } from './presenters.js';
-import { identifier, openProgramBody } from './schemas.js';
+import { identifier } from './schemas.js';
 
+/** Programs are opened and updated by the treasury feed; over HTTP they are read-only. */
 @Controller('programs')
 export class ProgramsController {
-  constructor(
-    private readonly commands: CommandBus,
-    private readonly queries: QueryBus,
-  ) {}
-
-  /** 201 when the program is new; 200 when this repeats a request that already opened it. */
-  @Post()
-  @RequireScopes(Scopes.ProgramsAdmin)
-  async open(
-    @Body(new ZodPipe(openProgramBody, 'body')) body: z.output<typeof openProgramBody>,
-    @Res({ passthrough: true }) response: Response,
-  ) {
-    const result = await this.commands.execute(
-      new OpenProgramCommand(ProgramId.of(body.programId), body.creditLimit),
-    );
-
-    response.status(result.created ? HttpStatus.CREATED : HttpStatus.OK);
-    return presentProgram(result.program);
-  }
+  constructor(private readonly queries: QueryBus) {}
 
   @Get(':programId/capacity')
   @RequireScopes(Scopes.CapacityRead)

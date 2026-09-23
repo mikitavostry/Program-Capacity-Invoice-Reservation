@@ -5,11 +5,8 @@ import type { AuthenticatedRequest } from '../../iam/decorators.js';
 const logger = new Logger('HTTP');
 
 /**
- * One line per request: what was asked, by whom, how it ended and how long it took.
- *
- * Middleware rather than an interceptor, deliberately: Nest runs interceptors after guards,
- * so an interceptor never sees the requests the guards turn away — and the refused 401s and
- * 403s are precisely the ones an audit trail most needs.
+ * One line per request, with the caller. Middleware, not an interceptor: interceptors run after
+ * guards and would miss the refused 401s and 403s.
  */
 export function requestLogging(request: Request, response: Response, next: NextFunction): void {
   const started = performance.now();

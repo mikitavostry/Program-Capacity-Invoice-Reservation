@@ -9,9 +9,7 @@ export interface RecordRepaymentResult {
   readonly repaidAmount: Money;
   /** Capacity this repayment freed, in the program's currency. May be zero. */
   readonly releasedAmount: Money;
-  /** The reservation as it stands now. */
   readonly reservation: ReservationView;
-  /** `true` when this id had already been applied and nothing new was written. */
   readonly replayed: boolean;
 }
 
@@ -19,7 +17,7 @@ export class RecordRepaymentCommand extends Command<RecordRepaymentResult> {
   constructor(
     readonly programId: ProgramId,
     readonly invoiceId: InvoiceId,
-    /** The caller's reference for this repayment, and its idempotency key. */
+    /** The idempotency key. */
     readonly repaymentId: RepaymentId,
     /** In the invoice's currency. `null` repays whatever is outstanding. */
     readonly amount: Money | null,

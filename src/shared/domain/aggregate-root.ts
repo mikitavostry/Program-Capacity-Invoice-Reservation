@@ -3,13 +3,8 @@ import { Entity } from './entity.js';
 import type { Identifier } from './identifier.js';
 
 /**
- * The entry point to an aggregate: the only object code outside the boundary may hold a
- * reference to, and the place the aggregate's invariants are enforced.
- *
- * This deliberately does not extend the `AggregateRoot` from `@nestjs/cqrs`. Events are
- * recorded here and published by the application layer, which keeps the domain free of a
- * framework dependency and — more usefully — leaves publication under the transaction's
- * control rather than the aggregate's.
+ * Records domain events for the application layer to persist with the change. Not Nest's
+ * `AggregateRoot`, to keep the domain free of framework code.
  */
 export abstract class AggregateRoot<TId extends Identifier> extends Entity<TId> {
   #events: DomainEvent[] = [];
@@ -22,10 +17,7 @@ export abstract class AggregateRoot<TId extends Identifier> extends Entity<TId> 
     return [...this.#events];
   }
 
-  /**
-   * Hands over the recorded events and forgets them, so a second drain returns nothing and
-   * no event can be published twice.
-   */
+  /** Returns the recorded events and clears them, so none is handled twice. */
   pullDomainEvents(): DomainEvent[] {
     const drained = this.#events;
     this.#events = [];
