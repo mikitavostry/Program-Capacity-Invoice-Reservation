@@ -115,6 +115,9 @@ model Reservation {
   id               String            @id
   programId        String            @map("program_id")
   invoiceId        String            @map("invoice_id")
+  /// The caller's key for this reservation of the invoice. Reserving an invoice again after it
+  /// was fully repaid requires a new one.
+  reservationKey   String?           @map("reservation_key")
   invoiceCurrency  String            @map("invoice_currency") @db.Char(3)
   invoiceMinor     BigInt            @map("invoice_minor")
   /// Always the program's currency; the composite foreign key enforces it.
@@ -134,7 +137,11 @@ model Reservation {
 
   /// An invoice may hold at most one live reservation against a program.
   @@unique([programId, invoiceId], map: "reservations_one_active_per_invoice", where: raw("status = 'ACTIVE'"))
+  /// A key names one reservation of an invoice. NULLs are distinct, so unkeyed rows never clash.
+  @@unique([programId, invoiceId, reservationKey])
   @@index([programId, reservedAt])
+  /// Whether an invoice was reserved before, including released reservations.
+  @@index([programId, invoiceId])
   @@map("reservations")
 }
 

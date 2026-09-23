@@ -168,6 +168,14 @@ describe('the treasury anti-corruption layer', () => {
       message({ program: { id: '   ', creditLimit: { amount: '1.00', currency: 'USD' } } }),
     ],
     [
+      'a program id the HTTP API could never address',
+      message({ program: { id: 'EU/2026', creditLimit: { amount: '1.00', currency: 'USD' } } }),
+    ],
+    [
+      'a program id with a space in it',
+      message({ program: { id: 'program 7', creditLimit: { amount: '1.00', currency: 'USD' } } }),
+    ],
+    [
       'a limit too large for the database to store',
       message({
         program: {

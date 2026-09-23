@@ -199,6 +199,10 @@ describe('ApplyTreasuryUpdateHandler', () => {
 
       expect(created.outcome).toBe('CREATED');
       expect(created.program?.status).toBe('SUSPENDED');
+      // Consumers learn it is suspended from the opening event itself.
+      expect(f.store.outbox).toHaveLength(1);
+      expect(f.store.outbox[0]).toBeInstanceOf(ProgramOpened);
+      expect((f.store.outbox[0] as ProgramOpened).status).toBe('SUSPENDED');
     });
 
     it('refuses a status change for a program it does not know, opening nothing', async () => {

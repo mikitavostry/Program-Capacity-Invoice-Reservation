@@ -8,7 +8,7 @@ import { ZodPipe } from '../../../../platform/http/request-validation.js';
 import { ListReservationsQuery } from '../../application/list-reservations/list-reservations.query.js';
 import { RecordRepaymentCommand } from '../../application/record-repayment/record-repayment.command.js';
 import { ReserveCapacityCommand } from '../../application/reserve-capacity/reserve-capacity.command.js';
-import { InvoiceId, ProgramId, RepaymentId } from '../../domain/ids.js';
+import { InvoiceId, ProgramId, RepaymentId, ReservationKey } from '../../domain/ids.js';
 import { presentRepayment, presentReservation, presentReservationPage } from './presenters.js';
 import {
   identifier,
@@ -24,7 +24,7 @@ export class ReservationsController {
     private readonly queries: QueryBus,
   ) {}
 
-  /** 201 for a new reservation; 200 when this repeats one the invoice already holds. */
+  /** 201 for a new reservation; 200 when this repeats an existing one. */
   @Post()
   @RequireScopes(Scopes.ReservationsWrite)
   async reserve(
@@ -37,6 +37,7 @@ export class ReservationsController {
         ProgramId.of(programId),
         InvoiceId.of(body.invoiceId),
         body.invoiceAmount,
+        body.reservationKey === undefined ? null : ReservationKey.of(body.reservationKey),
       ),
     );
 

@@ -59,34 +59,40 @@ export class TreasuryMessageProcessor {
       );
       this.failures.delete(partitionKey);
     } catch (error) {
-      if (error instanceof TreasuryMessageError) {
-        await this.deadLetters.publish(payload, error.message, error.issues);
-        this.failures.delete(partitionKey);
-        return;
-      }
-      if (isPermanent(error)) {
-        await this.deadLetters.publish(payload, describe(error), []);
-        this.failures.delete(partitionKey);
-        return;
-      }
+      const deadLetter =
+        error instanceof TreasuryMessageError
+          ? { reason: error.message, detail: error.issues }
+          : isPermanent(error)
+            ? { reason: describe(error), detail: [] }
+            : null;
+      if (deadLetter === null) return this.retryLater(error, at, partitionKey);
 
-      const attempt = (this.failures.get(partitionKey) ?? 0) + 1;
-      this.failures.set(partitionKey, attempt);
-      const delayMs = Math.min(
-        this.retry.initialDelayMs * 2 ** (attempt - 1),
-        this.retry.maxDelayMs,
-      );
-
-      const report = `Treasury message ${at} could not be applied yet (attempt ${attempt}): ${describe(error)}. Retrying in ${delayMs} ms.`;
-      if (attempt >= this.retry.alertAfterAttempts) {
-        this.logger.error(`${report} The partition is blocked behind it.`);
-      } else {
-        this.logger.warn(report);
+      try {
+        await this.deadLetters.publish(payload, deadLetter.reason, deadLetter.detail);
+      } catch (publishError) {
+        // The dead-letter topic is unreachable: retry the message later like any temporary
+        // failure, rather than redelivering it in a tight loop.
+        return this.retryLater(publishError, at, partitionKey);
       }
-
-      await this.retry.sleep(delayMs);
-      throw error;
+      this.failures.delete(partitionKey);
     }
+  }
+
+  /** Waits, backing off per partition, then rethrows so the message is redelivered. */
+  private async retryLater(error: unknown, at: string, partitionKey: string): Promise<never> {
+    const attempt = (this.failures.get(partitionKey) ?? 0) + 1;
+    this.failures.set(partitionKey, attempt);
+    const delayMs = Math.min(this.retry.initialDelayMs * 2 ** (attempt - 1), this.retry.maxDelayMs);
+
+    const report = `Treasury message ${at} could not be applied yet (attempt ${attempt}): ${describe(error)}. Retrying in ${delayMs} ms.`;
+    if (attempt >= this.retry.alertAfterAttempts) {
+      this.logger.error(`${report} The partition is blocked behind it.`);
+    } else {
+      this.logger.warn(report);
+    }
+
+    await this.retry.sleep(delayMs);
+    throw error;
   }
 }
 

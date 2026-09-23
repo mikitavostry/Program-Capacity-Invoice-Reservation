@@ -41,6 +41,10 @@ export const reservationResponse = z
     reservationId: z.string(),
     programId: z.string(),
     invoiceId: z.string(),
+    reservationKey: z
+      .string()
+      .nullable()
+      .describe('The key the reservation was made under; null when none was sent.'),
     status: z.enum(RESERVATION_STATUSES),
     invoiceAmount: moneyResponse.describe('In the invoice’s currency.'),
     reservedAmount: moneyResponse.describe('Held against the limit, in the program’s currency.'),

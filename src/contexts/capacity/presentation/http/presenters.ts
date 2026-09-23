@@ -36,6 +36,7 @@ export function presentReservation(view: ReservationView) {
     reservationId: view.reservationId,
     programId: view.programId,
     invoiceId: view.invoiceId,
+    reservationKey: view.reservationKey,
     status: view.status,
     invoiceAmount: money(view.invoiceAmount),
     reservedAmount: money(view.reservedAmount),

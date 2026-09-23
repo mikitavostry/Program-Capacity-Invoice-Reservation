@@ -98,6 +98,10 @@ curl localhost:3000/programs/program-1/capacity -H "Authorization: Bearer $TOKEN
 curl 'localhost:3000/programs/program-1/reservations?limit=20' -H "Authorization: Bearer $TOKEN"
 ```
 
+Once an invoice has been fully repaid, reserving it again needs a new `"reservationKey"` in the
+body; without one the request is refused (`409 INVOICE_ALREADY_REPAID`) as a possible late retry
+of the original. See [safe retries](docs/architecture.md#26-safe-retries).
+
 Amounts are always `{"amount": "<decimal string>", "currency": "<ISO 4217>"}` — strings, not
 JSON numbers. Errors are returned as RFC 9457 `application/problem+json` with a `code`; the full
 list is in the [architecture document](docs/architecture.md#37-http-api).
@@ -108,7 +112,7 @@ and <http://localhost:3000/docs/openapi.json>.
 ## Postman collection
 
 [`docs/postman/invoice-reservation.postman_collection.json`](docs/postman/invoice-reservation.postman_collection.json)
-contains **39 requests** covering the whole service. Every request has tests asserting the
+contains **40 requests** covering the whole service. Every request has tests asserting the
 expected status and body, so running the collection checks the service end to end — including
 the Kafka feed.
 
@@ -117,7 +121,7 @@ the Kafka feed.
 | 1. Health | liveness and readiness |
 | 2. Programs | treasury publishes a new program over Kafka; capacity once the feed has opened it; no HTTP endpoint for opening; unknown program |
 | 3. Reservations | same-currency and EUR reservations, repeats, insufficient capacity, invalid body, cursor paging |
-| 4. Repayments | partial and full repayment, repeated and reused repayment ids, overpayment, final capacity |
+| 4. Repayments | partial and full repayment, repeated and reused repayment ids, overpayment, a repaid invoice not reserved again without a new key, final capacity |
 | 5. Authentication and authorization | missing and tampered tokens, read-only token, reservations-only and repayments-only tokens, wrong program |
 | 6. Treasury updates | treasury raises the limit; a periodic reconciliation; treasury suspends the program (reservation refused) and reactivates it |
 

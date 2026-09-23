@@ -7,7 +7,7 @@ import { InvariantViolationError } from '../../../../../shared/domain/invariant-
 import { Currency } from '../../../../../shared/money/currency.js';
 import { ExchangeRate, RATE_DECIMAL_PLACES } from '../../../../../shared/money/exchange-rate.js';
 import { Money } from '../../../../../shared/money/money.js';
-import { InvoiceId, ProgramId, ReservationId } from '../../../domain/ids.js';
+import { InvoiceId, ProgramId, ReservationId, ReservationKey } from '../../../domain/ids.js';
 import { Program } from '../../../domain/program.js';
 import { Reservation } from '../../../domain/reservation.js';
 
@@ -68,6 +68,7 @@ export function toReservation(row: ReservationRecord): Reservation {
     id: ReservationId.of(row.id),
     programId: ProgramId.of(row.programId),
     invoiceId: InvoiceId.of(row.invoiceId),
+    reservationKey: row.reservationKey === null ? null : ReservationKey.of(row.reservationKey),
     invoiceAmount: Money.fromMinorUnits(row.invoiceMinor, invoiceCurrency),
     reservedAmount: Money.fromMinorUnits(row.reservedMinor, reservedCurrency),
     exchangeRate: toExchangeRate(row, invoiceCurrency, reservedCurrency),
@@ -86,6 +87,7 @@ export function fromReservation(reservation: Reservation): Prisma.ReservationUnc
     id: reservation.id.value,
     programId: reservation.programId.value,
     invoiceId: reservation.invoiceId.value,
+    reservationKey: reservation.reservationKey?.value ?? null,
     invoiceCurrency: reservation.invoiceAmount.currency.code,
     invoiceMinor: reservation.invoiceAmount.minorUnits,
     reservedCurrency: reservation.reservedAmount.currency.code,

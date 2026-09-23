@@ -21,13 +21,39 @@ export class ReservationNotFoundError extends DomainError {
   }
 }
 
-/** The invoice already holds a reservation for a different amount, so this is not a retry. */
+/** The invoice already holds a reservation this request does not repeat, so it is not a retry. */
 export class InvoiceAlreadyReservedError extends DomainError {
   readonly code = 'INVOICE_ALREADY_RESERVED';
 
-  constructor(invoiceId: InvoiceId, reserved: Money, requested: Money) {
+  private constructor(message: string) {
+    super(message);
+  }
+
+  /** The same invoice (and key, if any) for a different amount. */
+  static forAmount(invoiceId: InvoiceId, reserved: Money, requested: Money) {
+    return new InvoiceAlreadyReservedError(
+      `Invoice ${invoiceId.value} is already reserved for ${reserved}; a request for ${requested} does not match it.`,
+    );
+  }
+
+  /** A new key while the invoice still holds an active reservation. */
+  static stillActive(invoiceId: InvoiceId) {
+    return new InvoiceAlreadyReservedError(
+      `Invoice ${invoiceId.value} still holds an active reservation; a new reservation key cannot be used until it is fully repaid.`,
+    );
+  }
+}
+
+/**
+ * The invoice was reserved and fully repaid, and the request brings no new reservation key. It
+ * may be a delayed retry of the original request, which must not hold capacity again.
+ */
+export class InvoiceAlreadyRepaidError extends DomainError {
+  readonly code = 'INVOICE_ALREADY_REPAID';
+
+  constructor(invoiceId: InvoiceId) {
     super(
-      `Invoice ${invoiceId.value} already has an active reservation for ${reserved}; a new request for ${requested} does not match it.`,
+      `Invoice ${invoiceId.value} was reserved and has been fully repaid. To reserve it again, send a new reservationKey.`,
     );
   }
 }

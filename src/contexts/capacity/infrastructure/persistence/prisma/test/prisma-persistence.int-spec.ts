@@ -11,7 +11,13 @@ import { InvariantViolationError } from '../../../../../../shared/domain/invaria
 import { Currency } from '../../../../../../shared/money/currency.js';
 import { ExchangeRate } from '../../../../../../shared/money/exchange-rate.js';
 import { Money } from '../../../../../../shared/money/money.js';
-import { InvoiceId, ProgramId, RepaymentId, ReservationId } from '../../../../domain/ids.js';
+import {
+  InvoiceId,
+  ProgramId,
+  RepaymentId,
+  ReservationId,
+  ReservationKey,
+} from '../../../../domain/ids.js';
 import { Program } from '../../../../domain/program.js';
 import type { Reservation } from '../../../../domain/reservation.js';
 import { PrismaCapacityTransactionRunner } from '../prisma-capacity-transaction-runner.js';
@@ -60,6 +66,7 @@ describe('Prisma persistence', () => {
     amount: Money,
     exchangeRate: ExchangeRate | null = null,
     invoiceId = InvoiceId.of(`invoice-${randomUUID()}`),
+    reservationKey: ReservationKey | null = null,
   ): Promise<Reservation> {
     return runner.run(async (uow) => {
       const program = await uow.programs.lockById(programId);
@@ -68,6 +75,7 @@ describe('Prisma persistence', () => {
       const reservation = program.reserveFor({
         reservationId: ReservationId.of(randomUUID()),
         invoiceId,
+        reservationKey,
         invoiceAmount: amount,
         exchangeRate,
         at: RESERVED_AT,
@@ -174,6 +182,27 @@ describe('Prisma persistence', () => {
       ).resolves.toBeNull();
     });
 
+    it('finds a reservation by its key, released or not, and knows the invoice was repaid', async () => {
+      const id = await openProgram();
+      const invoiceId = InvoiceId.of('invoice-1');
+      const key = ReservationKey.of('round-1');
+      const reserved = await reserve(id, usd('100.00'), null, invoiceId, key);
+
+      await expect(
+        runner.run((uow) => uow.reservations.hasReleasedForInvoice(id, invoiceId)),
+      ).resolves.toBe(false);
+
+      await repay(reserved, null);
+      const found = await runner.run((uow) => uow.reservations.findByKey(id, invoiceId, key));
+
+      expect(found?.id.equals(reserved.id)).toBe(true);
+      expect(found?.reservationKey?.equals(key)).toBe(true);
+      expect(found?.status).toBe('RELEASED');
+      await expect(
+        runner.run((uow) => uow.reservations.hasReleasedForInvoice(id, invoiceId)),
+      ).resolves.toBe(true);
+    });
+
     it('persists a partial repayment', async () => {
       const id = await openProgram();
       const reserved = await reserve(id, usd('100.00'));
@@ -217,6 +246,25 @@ describe('Prisma persistence', () => {
         ['RESERVE', 10000n, 90000n, null],
         ['RELEASE', 4000n, 94000n, 'repayment-1'],
       ]);
+    });
+
+    it('records a repayment that leaves the program still over its limit', async () => {
+      const id = await openProgram(usd('1000.00'));
+      const reserved = await reserve(id, usd('800.00'));
+      // Treasury cut the limit to 500.00 under the 800.00 held.
+      await prisma.$executeRaw`UPDATE programs SET credit_limit_minor = 50000 WHERE id = ${id.value}`;
+
+      await repay(reserved, usd('100.00'));
+
+      const releases = await prisma.capacityMovement.findMany({
+        where: { programId: id.value, type: 'RELEASE' },
+      });
+      expect(releases.map((movement) => movement.availableAfterMinor)).toEqual([-20000n]);
+      await expect(capacityTotals(prisma, id.value)).resolves.toEqual({
+        counter: 70000n,
+        held: 70000n,
+        ledger: 70000n,
+      });
     });
 
     it('finds an applied repayment by its id, with what it repaid and freed', async () => {
@@ -303,6 +351,18 @@ describe('Prisma persistence', () => {
       await repay(first, null);
 
       await expect(reserve(id, usd('10.00'), null, invoiceId)).resolves.toBeDefined();
+    });
+
+    it('refuses a second reservation of an invoice under the same key', async () => {
+      const id = await openProgram();
+      const invoiceId = InvoiceId.of('invoice-1');
+      const key = ReservationKey.of('round-1');
+      const first = await reserve(id, usd('10.00'), null, invoiceId, key);
+      await repay(first, null);
+
+      await expect(reserve(id, usd('10.00'), null, invoiceId, key)).rejects.toThrow(
+        /Unique constraint|reservation_key/,
+      );
     });
 
     it('refuses a reservation held in a currency other than its program’s', async () => {

@@ -12,7 +12,7 @@
  * program id opens that program; later ones update it. `--malformed` sends something the schema
  * rejects, to watch it land in the dead-letter topic.
  *
- * `--sequence` defaults to the current time in seconds, so successive runs are always newer.
+ * `--sequence` defaults to the current time in milliseconds, so successive runs are always newer.
  * `--event-id` fixes the message id, so publishing the same message again is a duplicate.
  */
 import { randomUUID } from 'node:crypto';
@@ -82,7 +82,7 @@ const message = values.malformed
       eventId: values['event-id'] ?? `treasury-${randomUUID()}`,
       eventType,
       occurredAt: new Date().toISOString(),
-      sequence: Number(values.sequence ?? Math.floor(Date.now() / 1000)),
+      sequence: Number(values.sequence ?? Date.now()),
       program,
     });
 

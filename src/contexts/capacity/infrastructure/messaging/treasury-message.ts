@@ -3,7 +3,7 @@ import { Currency } from '../../../../shared/money/currency.js';
 import { DomainError } from '../../../../shared/domain/domain-error.js';
 import { MAX_MINOR_UNITS, Money } from '../../../../shared/money/money.js';
 import { ApplyTreasuryUpdateCommand } from '../../application/apply-treasury-update/apply-treasury-update.command.js';
-import { ProgramId } from '../../domain/ids.js';
+import { EXTERNAL_ID_PATTERN, EXTERNAL_ID_RULE, ProgramId } from '../../domain/ids.js';
 import { PROGRAM_STATUSES } from '../../domain/program.js';
 import type { TreasuryEventKind } from '../../domain/ports/treasury-event-log.js';
 
@@ -40,12 +40,8 @@ const envelope = {
   /** Strictly increasing per program across all event types. */
   sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 };
-const programId = z
-  .string()
-  .trim()
-  .min(1)
-  .max(128)
-  .refine(noNul, 'must not contain NUL characters');
+// The same rule as the HTTP API's: a program opened here must be addressable in a URL.
+const programId = z.string().trim().regex(EXTERNAL_ID_PATTERN, EXTERNAL_ID_RULE);
 const status = z.enum(PROGRAM_STATUSES);
 
 /*

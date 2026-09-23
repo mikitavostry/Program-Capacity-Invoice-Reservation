@@ -72,6 +72,7 @@ describe('capacity under concurrency', () => {
       const reservation = program.reserveFor({
         reservationId: ReservationId.of(randomUUID()),
         invoiceId: InvoiceId.of(`invoice-${randomUUID()}`),
+        reservationKey: null,
         invoiceAmount: amount,
         exchangeRate: null,
         at: new Date(),
@@ -184,6 +185,7 @@ describe('capacity under concurrency', () => {
             program!.reserveFor({
               reservationId: ReservationId.of(randomUUID()),
               invoiceId: InvoiceId.of('invoice-1'),
+              reservationKey: null,
               invoiceAmount: usd('10.00'),
               exchangeRate: null,
               at: new Date(),

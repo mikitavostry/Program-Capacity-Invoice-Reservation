@@ -19,7 +19,7 @@ import {
   ProgramOpened,
   ProgramStatusChanged,
 } from './events.js';
-import type { InvoiceId, ProgramId, RepaymentId, ReservationId } from './ids.js';
+import type { InvoiceId, ProgramId, RepaymentId, ReservationId, ReservationKey } from './ids.js';
 import { Reservation } from './reservation.js';
 
 export const PROGRAM_STATUSES = ['ACTIVE', 'SUSPENDED'] as const;
@@ -48,6 +48,7 @@ export interface TreasuryState {
 export interface ReserveCapacity {
   readonly reservationId: ReservationId;
   readonly invoiceId: InvoiceId;
+  readonly reservationKey: ReservationKey | null;
   readonly invoiceAmount: Money;
   /** Invoice currency → program currency; `null` when they are the same. */
   readonly exchangeRate: ExchangeRate | null;
@@ -87,7 +88,12 @@ export class Program extends AggregateRoot<ProgramId> {
     this.#treasurySequence = state.treasurySequence;
   }
 
-  static open(params: { id: ProgramId; creditLimit: Money; openedAt: Date }): Program {
+  static open(params: {
+    id: ProgramId;
+    creditLimit: Money;
+    openedAt: Date;
+    status?: ProgramStatus;
+  }): Program {
     if (!params.creditLimit.isPositive) {
       throw new InvalidAmountError(
         `A program's credit limit must be positive, received ${params.creditLimit}.`,
@@ -98,12 +104,14 @@ export class Program extends AggregateRoot<ProgramId> {
       id: params.id,
       creditLimit: params.creditLimit,
       reservedAmount: Money.zero(params.creditLimit.currency),
-      status: 'ACTIVE',
+      status: params.status ?? 'ACTIVE',
       version: 0,
       treasurySequence: 0,
     });
 
-    program.raise(new ProgramOpened(params.id, params.creditLimit, params.openedAt));
+    program.raise(
+      new ProgramOpened(params.id, params.creditLimit, program.#status, params.openedAt),
+    );
 
     return program;
   }
@@ -113,9 +121,14 @@ export class Program extends AggregateRoot<ProgramId> {
     id: ProgramId,
     state: TreasuryState & { readonly creditLimit: Money },
   ): Program {
-    const program = Program.open({ id, creditLimit: state.creditLimit, openedAt: state.at });
+    // The status goes into the opening event, so consumers never assume `ACTIVE`.
+    const program = Program.open({
+      id,
+      creditLimit: state.creditLimit,
+      openedAt: state.at,
+      status: state.status ?? 'ACTIVE',
+    });
     program.#treasurySequence = state.sequence;
-    program.#status = state.status ?? 'ACTIVE';
 
     return program;
   }
@@ -181,6 +194,7 @@ export class Program extends AggregateRoot<ProgramId> {
       id: request.reservationId,
       programId: this.id,
       invoiceId: request.invoiceId,
+      reservationKey: request.reservationKey,
       invoiceAmount: request.invoiceAmount,
       reservedAmount: toHold,
       exchangeRate: request.exchangeRate,
@@ -223,8 +237,11 @@ export class Program extends AggregateRoot<ProgramId> {
       );
     }
 
+    // Instances' clocks can disagree by a few milliseconds, so a repayment right after its
+    // reservation may be stamped before it; it is recorded at the reservation's time instead.
+    const at = new Date(Math.max(repayment.at.getTime(), reservation.reservedAt.getTime()));
     const repaid = repayment.amount ?? reservation.outstandingAmount;
-    const released = reservation.recordRepayment(repaid, repayment.at);
+    const released = reservation.recordRepayment(repaid, at);
 
     this.#reservedAmount = this.#reservedAmount.minus(released);
 
@@ -238,7 +255,7 @@ export class Program extends AggregateRoot<ProgramId> {
         releasedAmount: released,
         reservationFullyReleased: reservation.isReleased,
         availableAfter: this.availableCapacity,
-        occurredAt: repayment.at,
+        occurredAt: at,
       }),
     );
 

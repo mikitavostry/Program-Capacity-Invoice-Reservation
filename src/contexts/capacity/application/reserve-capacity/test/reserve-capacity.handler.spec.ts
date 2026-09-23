@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   capacityFixture,
   type CapacityFixture,
@@ -7,9 +7,13 @@ import { Currency } from '../../../../../shared/money/currency.js';
 import { Money } from '../../../../../shared/money/money.js';
 import { InsufficientCapacityError } from '../../../domain/errors.js';
 import { CapacityReserved } from '../../../domain/events.js';
-import { InvoiceId, ProgramId, RepaymentId } from '../../../domain/ids.js';
+import { InvoiceId, ProgramId, RepaymentId, ReservationKey } from '../../../domain/ids.js';
 import { ExchangeRateUnavailableError } from '../../../domain/ports/exchange-rate-provider.js';
-import { InvoiceAlreadyReservedError, ProgramNotFoundError } from '../../errors.js';
+import {
+  InvoiceAlreadyRepaidError,
+  InvoiceAlreadyReservedError,
+  ProgramNotFoundError,
+} from '../../errors.js';
 import { RecordRepaymentCommand } from '../../record-repayment/record-repayment.command.js';
 import { ReserveCapacityCommand } from '../reserve-capacity.command.js';
 
@@ -31,8 +35,20 @@ describe('ReserveCapacityHandler', () => {
     f.store.outbox.length = 0;
   });
 
-  const reserve = (amount: Money, invoice = INVOICE) =>
-    f.reserve.execute(new ReserveCapacityCommand(PROGRAM, invoice, amount));
+  const reserve = (amount: Money, invoice = INVOICE, key: string | null = null) =>
+    f.reserve.execute(
+      new ReserveCapacityCommand(
+        PROGRAM,
+        invoice,
+        amount,
+        key === null ? null : ReservationKey.of(key),
+      ),
+    );
+
+  const repayInFull = (repaymentId = 'repayment-1') =>
+    f.repay.execute(
+      new RecordRepaymentCommand(PROGRAM, INVOICE, RepaymentId.of(repaymentId), null),
+    );
 
   it('reserves capacity for an invoice in the program’s currency', async () => {
     const { reservation, created } = await reserve(usd('250.00'));
@@ -73,7 +89,7 @@ describe('ReserveCapacityHandler', () => {
     expect(f.rates.lookups).toHaveLength(0);
   });
 
-  it('refuses a currency it has no rate for, before any transaction opens', async () => {
+  it('refuses a currency it has no rate for, writing nothing', async () => {
     const commitsBefore = f.store.commits;
 
     await expect(reserve(Money.fromDecimal('1000', JPY))).rejects.toThrow(
@@ -101,16 +117,85 @@ describe('ReserveCapacityHandler', () => {
       expect(f.store.program(PROGRAM).reservedAmount.equals(usd('250.00'))).toBe(true);
     });
 
-    it('creates a new reservation once the first one has been fully repaid', async () => {
-      const first = await reserve(usd('250.00'));
-      await f.repay.execute(
-        new RecordRepaymentCommand(PROGRAM, INVOICE, RepaymentId.of('repayment-1'), null),
-      );
+    it('is answered even while exchange rates are unavailable, since it needs none', async () => {
+      const first = await reserve(eur('100.00'));
+      vi.spyOn(f.rates, 'rateFor').mockRejectedValue(new Error('rate service is down'));
 
-      const second = await reserve(usd('250.00'));
+      const second = await reserve(eur('100.00'));
+
+      expect(second.created).toBe(false);
+      expect(second.reservation.reservationId).toBe(first.reservation.reservationId);
+    });
+
+    it('still fails for a new reservation while exchange rates are unavailable', async () => {
+      vi.spyOn(f.rates, 'rateFor').mockRejectedValue(new Error('rate service is down'));
+
+      await expect(reserve(eur('100.00'))).rejects.toThrow('rate service is down');
+      expect(f.store.program(PROGRAM).reservedAmount.isZero).toBe(true);
+    });
+  });
+
+  describe('an invoice that has been fully repaid', () => {
+    it('is not reserved again without a key, since the request may be a late retry', async () => {
+      await reserve(usd('250.00'));
+      await repayInFull();
+      const commitsBefore = f.store.commits;
+
+      await expect(reserve(usd('250.00'))).rejects.toThrow(InvoiceAlreadyRepaidError);
+
+      expect(f.store.commits).toBe(commitsBefore);
+      expect(f.store.program(PROGRAM).reservedAmount.isZero).toBe(true);
+    });
+
+    it('is reserved again under a new key', async () => {
+      const first = await reserve(usd('250.00'));
+      await repayInFull();
+
+      const second = await reserve(usd('250.00'), INVOICE, 'round-2');
 
       expect(second.created).toBe(true);
       expect(second.reservation.reservationId).not.toBe(first.reservation.reservationId);
+      expect(second.reservation.reservationKey).toBe('round-2');
+      expect(f.store.program(PROGRAM).reservedAmount.equals(usd('250.00'))).toBe(true);
+    });
+
+    it('answers a late retry under the original key with the released reservation', async () => {
+      const first = await reserve(usd('250.00'), INVOICE, 'round-1');
+      await repayInFull();
+
+      const retry = await reserve(usd('250.00'), INVOICE, 'round-1');
+
+      expect(retry.created).toBe(false);
+      expect(retry.reservation.reservationId).toBe(first.reservation.reservationId);
+      expect(retry.reservation.status).toBe('RELEASED');
+      expect(f.store.program(PROGRAM).reservedAmount.isZero).toBe(true);
+    });
+  });
+
+  describe('a reservation key', () => {
+    it('makes a repeat under the same key a retry', async () => {
+      const first = await reserve(usd('250.00'), INVOICE, 'round-1');
+      const second = await reserve(usd('250.00'), INVOICE, 'round-1');
+
+      expect(second.created).toBe(false);
+      expect(second.reservation.reservationId).toBe(first.reservation.reservationId);
+    });
+
+    it('refuses the same key for a different amount', async () => {
+      await reserve(usd('250.00'), INVOICE, 'round-1');
+
+      await expect(reserve(usd('300.00'), INVOICE, 'round-1')).rejects.toThrow(
+        InvoiceAlreadyReservedError,
+      );
+    });
+
+    it('refuses a new key while the invoice still holds an active reservation', async () => {
+      await reserve(usd('250.00'), INVOICE, 'round-1');
+
+      await expect(reserve(usd('250.00'), INVOICE, 'round-2')).rejects.toThrow(
+        InvoiceAlreadyReservedError,
+      );
+      expect(f.store.program(PROGRAM).reservedAmount.equals(usd('250.00'))).toBe(true);
     });
   });
 

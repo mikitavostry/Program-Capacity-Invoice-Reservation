@@ -303,7 +303,11 @@ describe('capacity API', () => {
       );
       expect(refused.body.code).toBe('INSUFFICIENT_CAPACITY');
 
-      await repay('invoice-1', { repaymentId: 'repayment-1', amount: usd('400.00') }).expect(201);
+      // A repayment that leaves the program still over limit is recorded all the same.
+      await repay('invoice-1', { repaymentId: 'repayment-1', amount: usd('100.00') }).expect(201);
+      await capacityBecomes({ availableCapacity: usd('-200.00') });
+
+      await repay('invoice-1', { repaymentId: 'repayment-2', amount: usd('300.00') }).expect(201);
       await capacityBecomes({ availableCapacity: usd('100.00') });
       await reserve({ invoiceId: 'invoice-2', invoiceAmount: usd('100.00') }).expect(201);
     });
@@ -563,6 +567,21 @@ describe('capacity API', () => {
         code: 'REPAYMENT_EXCEEDS_OUTSTANDING',
         outstanding: usd('100.00'),
       });
+    });
+
+    it('does not reserve a repaid invoice again unless the request brings a new key', async () => {
+      await repay('invoice-1', { repaymentId: 'repayment-1' }).expect(201);
+      const body = { invoiceId: 'invoice-1', invoiceAmount: usd('100.00') };
+
+      // A late retry of the original request must not hold the invoice's capacity again.
+      const refused = await reserve(body).expect(409);
+      expect(refused.body.code).toBe('INVOICE_ALREADY_REPAID');
+      await capacityBecomes({ reservedAmount: usd('0.00') });
+
+      const again = await reserve({ ...body, reservationKey: 'round-2' }).expect(201);
+      expect(again.body).toMatchObject({ reservationKey: 'round-2', status: 'ACTIVE' });
+      await reserve({ ...body, reservationKey: 'round-2' }).expect(200);
+      await capacityBecomes({ reservedAmount: usd('100.00') });
     });
 
     it('reports an invoice with nothing to repay as 404', async () => {

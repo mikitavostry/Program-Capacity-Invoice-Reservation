@@ -22,7 +22,7 @@ describe('the published capacity events', () => {
   it('wrap every event in the same envelope', () => {
     const message = toCapacityEventMessage(
       'event-1',
-      new ProgramOpened(PROGRAM, usd('1000.00'), AT),
+      new ProgramOpened(PROGRAM, usd('1000.00'), 'ACTIVE', AT),
     );
 
     expect(message).toEqual({
@@ -30,7 +30,7 @@ describe('the published capacity events', () => {
       eventType: 'capacity.program-opened',
       occurredAt: '2026-09-22T10:00:00.000Z',
       programId: 'program-1',
-      data: { creditLimit: { amount: '1000.00', currency: 'USD' } },
+      data: { creditLimit: { amount: '1000.00', currency: 'USD' }, status: 'ACTIVE' },
     });
   });
 

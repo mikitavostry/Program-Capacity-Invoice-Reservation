@@ -7,7 +7,7 @@ import {
   RepaymentExceedsOutstandingError,
   ReservationAlreadyReleasedError,
 } from './errors.js';
-import type { InvoiceId, ProgramId, ReservationId } from './ids.js';
+import type { InvoiceId, ProgramId, ReservationId, ReservationKey } from './ids.js';
 
 export const RESERVATION_STATUSES = ['ACTIVE', 'RELEASED'] as const;
 export type ReservationStatus = (typeof RESERVATION_STATUSES)[number];
@@ -16,6 +16,8 @@ export interface ReservationSnapshot {
   readonly id: ReservationId;
   readonly programId: ProgramId;
   readonly invoiceId: InvoiceId;
+  /** The caller's key for this reservation of the invoice; `null` when none was sent. */
+  readonly reservationKey: ReservationKey | null;
   /** The amount as the invoice states it, in the invoice's currency. */
   readonly invoiceAmount: Money;
   /** The capacity held against the program when the reservation was made, in its currency. */
@@ -49,6 +51,7 @@ export type NewReservation = Omit<
 export class Reservation extends AggregateRoot<ReservationId> {
   readonly programId: ProgramId;
   readonly invoiceId: InvoiceId;
+  readonly reservationKey: ReservationKey | null;
   readonly invoiceAmount: Money;
   readonly reservedAmount: Money;
   readonly exchangeRate: ExchangeRate | null;
@@ -63,6 +66,7 @@ export class Reservation extends AggregateRoot<ReservationId> {
     super(state.id);
     this.programId = state.programId;
     this.invoiceId = state.invoiceId;
+    this.reservationKey = state.reservationKey;
     this.invoiceAmount = state.invoiceAmount;
     this.reservedAmount = state.reservedAmount;
     this.exchangeRate = state.exchangeRate;
@@ -183,6 +187,7 @@ export class Reservation extends AggregateRoot<ReservationId> {
       id: this.id,
       programId: this.programId,
       invoiceId: this.invoiceId,
+      reservationKey: this.reservationKey,
       invoiceAmount: this.invoiceAmount,
       reservedAmount: this.reservedAmount,
       exchangeRate: this.exchangeRate,

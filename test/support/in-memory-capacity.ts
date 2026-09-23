@@ -21,6 +21,7 @@ import type {
   ProgramId,
   RepaymentId,
   ReservationId,
+  ReservationKey,
 } from '../../src/contexts/capacity/domain/ids.js';
 import type {
   CapacityLedger,
@@ -167,10 +168,35 @@ class InMemoryReservationRepository implements ReservationRepository {
     return snapshot === undefined ? null : Reservation.rehydrate(snapshot);
   }
 
+  async findByKey(
+    programId: ProgramId,
+    invoiceId: InvoiceId,
+    key: ReservationKey,
+  ): Promise<Reservation | null> {
+    const snapshot = this.forInvoice(programId, invoiceId).find(
+      (r) => r.reservationKey !== null && r.reservationKey.equals(key),
+    );
+    return snapshot === undefined ? null : Reservation.rehydrate(snapshot);
+  }
+
+  async hasReleasedForInvoice(programId: ProgramId, invoiceId: InvoiceId): Promise<boolean> {
+    return this.forInvoice(programId, invoiceId).some((r) => r.status === 'RELEASED');
+  }
+
   async insert(reservation: Reservation): Promise<void> {
     // Mirrors the partial unique index on active reservations.
     if (this.activeFor(reservation.programId, reservation.invoiceId) !== undefined) {
       throw new Error('Unique constraint: reservations_one_active_per_invoice');
+    }
+    // Mirrors the unique index on the reservation key.
+    const key = reservation.reservationKey;
+    if (
+      key !== null &&
+      this.forInvoice(reservation.programId, reservation.invoiceId).some(
+        (r) => r.reservationKey !== null && r.reservationKey.equals(key),
+      )
+    ) {
+      throw new Error('Unique constraint: reservations_program_id_invoice_id_reservation_key_key');
     }
     this.store.reservations.set(reservation.id.value, reservation.toSnapshot());
   }
@@ -180,9 +206,12 @@ class InMemoryReservationRepository implements ReservationRepository {
   }
 
   private activeFor(programId: ProgramId, invoiceId: InvoiceId): ReservationSnapshot | undefined {
-    return [...this.store.reservations.values()].find(
-      (r) =>
-        r.programId.equals(programId) && r.invoiceId.equals(invoiceId) && r.status === 'ACTIVE',
+    return this.forInvoice(programId, invoiceId).find((r) => r.status === 'ACTIVE');
+  }
+
+  private forInvoice(programId: ProgramId, invoiceId: InvoiceId): ReservationSnapshot[] {
+    return [...this.store.reservations.values()].filter(
+      (r) => r.programId.equals(programId) && r.invoiceId.equals(invoiceId),
     );
   }
 }

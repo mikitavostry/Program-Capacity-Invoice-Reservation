@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { Currency } from '../../../../shared/money/currency.js';
 import { MAX_MINOR_UNITS, Money } from '../../../../shared/money/money.js';
+import { EXTERNAL_ID_PATTERN, EXTERNAL_ID_RULE } from '../../domain/ids.js';
 import { RESERVATION_STATUSES } from '../../domain/reservation.js';
 import { MAX_PAGE_SIZE } from '../../application/list-reservations/list-reservations.query.js';
 
@@ -10,11 +11,9 @@ import { MAX_PAGE_SIZE } from '../../application/list-reservations/list-reservat
  */
 
 /** Ids appear in URLs, so only characters that need no escaping. */
-const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-
 export const identifier = z
   .string({ error: 'must be a string' })
-  .regex(ID_PATTERN, "must be 1–128 characters of letters, digits, '.', '_', ':' or '-'");
+  .regex(EXTERNAL_ID_PATTERN, EXTERNAL_ID_RULE);
 
 /** `{ "amount": "1234.56", "currency": "USD" }`; a JSON number is refused, having been a float. */
 export const money = z
@@ -47,7 +46,12 @@ export const money = z
   });
 
 export const reserveCapacityBody = z
-  .object({ invoiceId: identifier, invoiceAmount: money })
+  .object({
+    invoiceId: identifier,
+    invoiceAmount: money,
+    /** Required only to reserve an invoice again after it was fully repaid. */
+    reservationKey: identifier.optional(),
+  })
   .strict();
 
 export const recordRepaymentBody = z

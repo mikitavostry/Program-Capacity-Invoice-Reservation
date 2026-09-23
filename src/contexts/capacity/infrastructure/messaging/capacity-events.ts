@@ -40,7 +40,7 @@ function eventTypeOf(event: DomainEvent): string {
 
 function dataOf(event: DomainEvent): Record<string, unknown> {
   if (event instanceof ProgramOpened) {
-    return { creditLimit: event.creditLimit.toJSON() };
+    return { creditLimit: event.creditLimit.toJSON(), status: event.status };
   }
   if (event instanceof CapacityReserved) {
     return {

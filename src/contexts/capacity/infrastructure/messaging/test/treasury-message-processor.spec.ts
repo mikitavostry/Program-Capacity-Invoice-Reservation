@@ -155,6 +155,15 @@ describe('TreasuryMessageProcessor', () => {
       expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([100, 200, 100]);
     });
 
+    it('retries with a backoff when the dead-letter topic cannot be reached', async () => {
+      publish.mockRejectedValue(new Error('broker unreachable'));
+
+      await expect(processor.process(payload('{ not json'))).rejects.toThrow('broker unreachable');
+      await expect(processor.process(payload('{ not json'))).rejects.toThrow('broker unreachable');
+
+      expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([100, 200]);
+    });
+
     it('does not wait when a message is parked', async () => {
       await processor.process(payload('{ not json'));
 

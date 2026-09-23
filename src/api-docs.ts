@@ -125,7 +125,11 @@ export function buildApiDocument(): OpenAPIObject {
           ],
           responses: {
             200: { description: 'A page of reservations.', content: json(ref('ReservationPage')) },
-            ...problems({ 400: 'An invalid query (`INVALID_QUERY`).', ...AUTH_ERRORS }),
+            ...problems({
+              400: 'An invalid query parameter (`VALIDATION_FAILED`) or cursor (`INVALID_QUERY`).',
+              ...AUTH_ERRORS,
+              404: 'No such program (`PROGRAM_NOT_FOUND`).',
+            }),
           },
         },
         post: {
@@ -135,7 +139,9 @@ export function buildApiDocument(): OpenAPIObject {
           description:
             'Scope: `reservations:write`. Holds the invoice’s full amount, converted into the ' +
             'program’s currency if needed. Repeating the request for the same invoice and amount ' +
-            'returns the existing reservation with 200.',
+            '(and `reservationKey`, if one was sent) returns the existing reservation with 200. ' +
+            'Once an invoice’s reservation has been fully repaid, reserving it again requires a ' +
+            'new `reservationKey`; without one the request is refused as a possible late retry.',
           parameters: [programIdParameter],
           requestBody: { required: true, content: json(ref('ReserveCapacityRequest')) },
           responses: {
@@ -148,7 +154,7 @@ export function buildApiDocument(): OpenAPIObject {
               400: 'An invalid body (`VALIDATION_FAILED`, `MALFORMED_JSON`).',
               ...AUTH_ERRORS,
               404: 'No such program (`PROGRAM_NOT_FOUND`).',
-              409: 'It does not fit (`INSUFFICIENT_CAPACITY`), the program is suspended (`PROGRAM_NOT_ACTIVE`), or the invoice holds a reservation for another amount (`INVOICE_ALREADY_RESERVED`).',
+              409: 'It does not fit (`INSUFFICIENT_CAPACITY`), the program is suspended (`PROGRAM_NOT_ACTIVE`), the invoice holds a reservation this request does not repeat (`INVOICE_ALREADY_RESERVED`), or it was fully repaid and no new `reservationKey` was sent (`INVOICE_ALREADY_REPAID`).',
               413: 'The body is too large (`PAYLOAD_TOO_LARGE`).',
               422: 'No rate to convert the invoice’s currency (`CURRENCY_NOT_CONVERTIBLE`), or an invalid amount.',
               503: 'The program is busy; retry after `Retry-After` seconds (`CAPACITY_BUSY`).',
@@ -173,10 +179,11 @@ export function buildApiDocument(): OpenAPIObject {
             201: { description: 'Applied.', content: json(ref('Repayment')) },
             200: { description: 'A repeat of this repayment id.', content: json(ref('Repayment')) },
             ...problems({
-              400: 'An invalid body.',
+              400: 'An invalid body (`VALIDATION_FAILED`, `MALFORMED_JSON`).',
               ...AUTH_ERRORS,
               404: 'Nothing to repay for this invoice (`RESERVATION_NOT_FOUND`).',
               409: 'The repayment id was used for something else (`REPAYMENT_ID_REUSED`), or the reservation is already released.',
+              413: 'The body is too large (`PAYLOAD_TOO_LARGE`).',
               422: 'More than is outstanding (`REPAYMENT_EXCEEDS_OUTSTANDING`), or in the wrong currency (`REPAYMENT_CURRENCY_MISMATCH`).',
               503: 'The program is busy; retry after `Retry-After` seconds (`CAPACITY_BUSY`).',
             }),

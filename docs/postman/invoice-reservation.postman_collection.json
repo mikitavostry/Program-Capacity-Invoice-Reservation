@@ -1161,6 +1161,54 @@
           }
         },
         {
+          "name": "Reserve the repaid invoice again without a new key",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 — a late retry must not hold a repaid invoice's capacity again\", () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"application/problem+json\");",
+                  "  pm.expect(pm.response.json().code).to.eql(\"INVOICE_ALREADY_REPAID\");",
+                  "  pm.expect(pm.response.json().detail).to.include(\"reservationKey\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"{{eurInvoiceId}}\",\n  \"invoiceAmount\": {\n    \"amount\": \"100000.00\",\n    \"currency\": \"EUR\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programId}}/reservations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programId}}",
+                "reservations"
+              ]
+            }
+          }
+        },
+        {
           "name": "List released reservations",
           "event": [
             {

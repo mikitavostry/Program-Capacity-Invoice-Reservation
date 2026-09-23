@@ -8,10 +8,13 @@ export class ProgramOpened implements DomainEvent {
   readonly aggregateId: string;
   readonly occurredAt: Date;
   readonly creditLimit: Money;
+  /** Treasury may open a program already suspended. */
+  readonly status: ProgramStatus;
 
-  constructor(programId: ProgramId, creditLimit: Money, occurredAt: Date) {
+  constructor(programId: ProgramId, creditLimit: Money, status: ProgramStatus, occurredAt: Date) {
     this.aggregateId = programId.value;
     this.creditLimit = creditLimit;
+    this.status = status;
     this.occurredAt = new Date(occurredAt);
   }
 }

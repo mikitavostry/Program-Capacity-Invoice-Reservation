@@ -17,6 +17,7 @@ export interface ReservationView {
   readonly reservationId: string;
   readonly programId: string;
   readonly invoiceId: string;
+  readonly reservationKey: string | null;
   readonly status: ReservationStatus;
   readonly invoiceAmount: Money;
   readonly reservedAmount: Money;
@@ -50,6 +51,7 @@ export function toReservationView(reservation: Reservation): ReservationView {
     reservationId: reservation.id.value,
     programId: reservation.programId.value,
     invoiceId: reservation.invoiceId.value,
+    reservationKey: reservation.reservationKey?.value ?? null,
     status: reservation.status,
     invoiceAmount: reservation.invoiceAmount,
     reservedAmount: reservation.reservedAmount,

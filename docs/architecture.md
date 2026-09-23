@@ -64,6 +64,8 @@ The brief leaves these open; this is how the service reads them.
   currency). The service does not own invoices and cannot verify it; it fixes the amount on the
   first reservation and caps repayments by it.
 - An invoice has at most one active reservation per program.
+- Once an invoice's reservation has been fully repaid, the invoice is reserved again only under
+  a new `reservationKey` (§2.6).
 - Reservations for a program can be listed, filtered by status and paged with a cursor.
 
 ### 2.3 Repayments
@@ -91,7 +93,9 @@ The brief leaves these open; this is how the service reads them.
   the status. A status change for a program that has never been opened is dead-lettered.
 - Treasury may lower a limit below what is already reserved. The new limit is applied and the
   program is **over limit**: available capacity is negative, new reservations are refused, and
-  repayments bring it back under. Existing reservations are not affected.
+  repayments bring it back under — each one is accepted, including one that leaves the program
+  still over limit (its ledger row records the negative availability). Existing reservations are
+  not affected.
 - Periodic reconciliation messages carry the program's full state again — limit and status —
   so anything an earlier message missed is brought up to date.
 - The reserved amount is this service's alone: reservations are made here, and treasury never
@@ -103,11 +107,19 @@ Every write can be retried without being applied twice:
 
 | Operation | Repeat with the same data | Repeat with different data |
 | --- | --- | --- |
-| Reserve (same program + invoice, while active) | returns the existing reservation (`200`) | `INVOICE_ALREADY_RESERVED` |
+| Reserve without a key (same program + invoice, while active) | returns the existing reservation (`200`) | `INVOICE_ALREADY_RESERVED` |
+| Reserve with a `reservationKey` (same program + invoice + key) | returns that reservation (`200`), even once released | `INVOICE_ALREADY_RESERVED` |
 | Repay (same `repaymentId`) | returns the original result (`replayed: true`) | `REPAYMENT_ID_REUSED` |
 | Treasury message (same `eventId`) | applied once | — |
 
-A reserve request repeated after the invoice has been fully repaid creates a new reservation.
+**Reserving an invoice again after it was repaid.** A reserve request without a key, for an
+invoice whose reservation has been fully repaid, is refused with `409 INVOICE_ALREADY_REPAID`.
+It may be a retry of the original request that arrived late (a caller's retry queue, a
+redelivered message); creating a new reservation would hold capacity for an invoice that is
+already settled. To finance the invoice again, the caller sends a new `reservationKey`, which
+names that reservation for good: its retries are answered with it, released or not. A new key is
+refused while the invoice still holds an active reservation. The key is optional otherwise, so
+callers that never re-reserve need not send one.
 
 ### 2.7 History
 
@@ -278,6 +290,7 @@ erDiagram
         text id PK
         text program_id FK "with reserved_currency"
         text invoice_id "one ACTIVE reservation per program + invoice"
+        text reservation_key "caller's key; unique per program + invoice"
         char3 invoice_currency
         bigint invoice_minor
         char3 reserved_currency FK "always the program's currency"
@@ -326,8 +339,10 @@ Amounts are stored as `BIGINT` minor units beside a currency code. The database 
 the main rules (Prisma schema plus hand-written SQL in the migrations):
 
 - `CHECK`s — positive limit, `reserved ≥ 0`, `0 ≤ repaid ≤ invoice`, `0 ≤ released ≤ reserved`,
+  a ledger movement never negative (its `available_after` may be, while over limit),
   `RELEASED` ⇔ fully repaid ⇔ `released_at` set, rate and its timestamp set together
-- partial unique indexes — one active reservation per invoice, one `RESERVE` per reservation
+- unique indexes — one active reservation per invoice, one `RESERVE` per reservation, one
+  reservation per invoice and `reservation_key`
 - composite foreign keys on `(program_id, currency)` — a reservation's held amount and every
   ledger row are in their program's currency (the invoice itself may be in any currency), and a
   program's currency cannot be changed once anything refers to it (`ON UPDATE RESTRICT`)
@@ -362,7 +377,8 @@ reading availability, `reservations:write` for the system that approves invoices
 `repayments:write` for the one that learns of repayments.
 
 **Input.** Parsed with zod directly into domain values. Amounts are decimal strings, unknown
-fields are rejected, ids are URL-safe, bodies are limited to 16 KB.
+fields are rejected, ids are URL-safe (1–128 of letters, digits, `.`, `_`, `:`, `-`; the treasury
+feed enforces the same rule on program ids), bodies are limited to 16 KB.
 
 **Errors.** RFC 9457 `application/problem+json` with a `code`, a `detail`, and extra fields where
 relevant (e.g. `requested` / `available`).
@@ -372,7 +388,7 @@ relevant (e.g. `requested` / `available`).
 | 400 | `VALIDATION_FAILED`, `MALFORMED_JSON`, `INVALID_QUERY` |
 | 401 / 403 | `UNAUTHENTICATED` / `FORBIDDEN` |
 | 404 | `PROGRAM_NOT_FOUND`, `RESERVATION_NOT_FOUND`, `NOT_FOUND` |
-| 409 | `INSUFFICIENT_CAPACITY`, `PROGRAM_NOT_ACTIVE`, `INVOICE_ALREADY_RESERVED`, `RESERVATION_ALREADY_RELEASED`, `REPAYMENT_ID_REUSED` |
+| 409 | `INSUFFICIENT_CAPACITY`, `PROGRAM_NOT_ACTIVE`, `INVOICE_ALREADY_RESERVED`, `INVOICE_ALREADY_REPAID`, `RESERVATION_ALREADY_RELEASED`, `REPAYMENT_ID_REUSED` |
 | 413 | `PAYLOAD_TOO_LARGE` |
 | 422 | `INVALID_AMOUNT`, `REPAYMENT_EXCEEDS_OUTSTANDING`, `REPAYMENT_CURRENCY_MISMATCH`, `CURRENCY_NOT_CONVERTIBLE`, `UNSUPPORTED_CURRENCY` |
 | 500 | `INTERNAL_ERROR` (includes invariant violations and unmapped codes) |
@@ -403,6 +419,8 @@ nothing else is accepted:
 ```
 
 - `status` is `ACTIVE` or `SUSPENDED`.
+- The program id follows the HTTP API's id rule (§3.7), so every program treasury opens can be
+  addressed over HTTP; any other id is dead-lettered.
 - A program is opened by the first capacity change or reconciliation for its id. A status change
   cannot open one (there is no limit to open it with) and is dead-lettered as `PROGRAM_NOT_FOUND`.
 - A reconciliation is the full state, so after it the program matches treasury in everything
@@ -426,7 +444,7 @@ Flow: `treasury-feed` (subscription) → `treasury-message-processor` (error han
 | Failure | Examples | Action |
 | --- | --- | --- |
 | Permanent | invalid JSON, wrong schema, a credit limit that is not positive, an amount in another currency than the program's | published to the dead-letter topic with the original bytes; consumption continues |
-| Temporary | program locked, database unavailable | error rethrown after a backoff (200 ms doubling to 10 s); offset not committed; message redelivered |
+| Temporary | program locked, database unavailable, dead-letter topic unreachable | error rethrown after a backoff (200 ms doubling to 10 s); offset not committed; message redelivered |
 
 Unrecognised errors are treated as temporary. The client redelivers a failed message
 immediately, so the backoff is what keeps an outage from becoming a tight retry loop; waiting
@@ -517,7 +535,7 @@ What this service announces, on `KAFKA_CAPACITY_EVENTS_TOPIC` (default `capacity
 
 | `eventType` | When |
 | --- | --- |
-| `capacity.program-opened` | treasury's first message for a program opened it |
+| `capacity.program-opened` | treasury's first message for a program opened it (with its `creditLimit` and `status`, which may be `SUSPENDED`) |
 | `capacity.reserved` | capacity was reserved for an invoice |
 | `capacity.released` | a repayment released capacity |
 | `capacity.credit-limit-changed` | treasury changed the limit (with `overLimit`) |
@@ -592,6 +610,9 @@ Deliberately left out of this version, and needed before it handles real money:
   that can publish there can open programs and change limits — and the topics themselves,
   created by infrastructure as code with the settings in `docker/redpanda/create-topics.sh` and a
   replication factor of 3 (`min.insync.replicas=2`).
+- **A production image.** The Docker image runs with `NODE_ENV=development` and keeps dev
+  dependencies, so the Compose stack can mint tokens and play treasury from it. Production needs
+  its own stage: `npm ci --omit=dev`, `NODE_ENV=production`, migrations run as a separate job.
 - **Metrics and alerting.** Consumer-group lag on the treasury feed, the outbox backlog and the
   dead-letter topic's growth are what to alert on; today they show only in the logs (a partition
   stuck behind a failing message is logged as an error after ten attempts).

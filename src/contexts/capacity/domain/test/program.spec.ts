@@ -56,6 +56,7 @@ function reserve(
   return program.reserveFor({
     reservationId: ReservationId.of(`reservation-${sequence}`),
     invoiceId: InvoiceId.of(`invoice-${sequence}`),
+    reservationKey: null,
     invoiceAmount: amount,
     exchangeRate,
     at: RESERVED_AT,
@@ -288,6 +289,23 @@ describe('Program', () => {
   });
 
   describe('releasing in full', () => {
+    it('records a repayment stamped a moment before its reservation at the reservation’s time', () => {
+      const program = openProgram('1000.00');
+      const reservation = reserve(program, usd('250.00'));
+      program.pullDomainEvents();
+
+      // Another instance's clock runs a few milliseconds behind.
+      program.release(reservation, {
+        repaymentId: RepaymentId.of('repayment-skewed'),
+        amount: null,
+        at: new Date(RESERVED_AT.getTime() - 5),
+      });
+
+      expect(reservation.releasedAt?.toISOString()).toBe(RESERVED_AT.toISOString());
+      const [event] = program.pullDomainEvents() as CapacityReleased[];
+      expect(event.occurredAt.toISOString()).toBe(RESERVED_AT.toISOString());
+    });
+
     it('frees exactly what was reserved and restores availability', () => {
       const program = openProgram('1000.00');
       const reservation = reserve(program, usd('250.00'));
@@ -512,6 +530,7 @@ describe('Program', () => {
         id: ReservationId.of('existing'),
         programId: PROGRAM_ID,
         invoiceId: InvoiceId.of('invoice-existing'),
+        reservationKey: null,
         invoiceAmount: usd('250.00'),
         reservedAmount: usd('250.00'),
         exchangeRate: null,
