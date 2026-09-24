@@ -5,7 +5,7 @@ capacity when approved for early payment, and release it back when repaid. Progr
 credit limits come from an external treasury system over Kafka, including periodic bulk
 reconciliation messages. Programs and invoices may be denominated in different currencies.
 
-What the service does, how it is built, and the assumptions and trade-offs behind it:
+What the service does, how it is built, and the assumptions and design decisions behind it:
 **[docs/architecture.md](docs/architecture.md)**.
 
 ## Stack
@@ -257,6 +257,7 @@ Tests refuse to run against a database whose name does not contain `test`.
 
 - Run `npm run typecheck` as well as the tests: `nest build` skips spec files and Vitest does not
   check types.
-- Install with `npm ci`. To regenerate the lockfile on npm 10, use
-  `npm install --legacy-peer-deps`.
 - Prisma is pinned to exactly 7.10.0, CLI and client together.
+- `npm audit` reports high-severity advisories in `mysql2` and `deepmerge-ts`, both inside the
+  Prisma CLI (the latest 7.x). Neither is reachable: the service never loads the CLI at runtime,
+  migrations run against Postgres only, and the only config it merges is `prisma.config.ts`.

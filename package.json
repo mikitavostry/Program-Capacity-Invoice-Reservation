@@ -2,7 +2,7 @@
   "name": "invoice-reservation",
   "version": "0.0.1",
   "description": "Program capacity tracking and invoice reservation service",
-  "author": "",
+  "author": "Mikita Vostry",
   "private": true,
   "license": "UNLICENSED",
   "type": "module",
@@ -67,9 +67,7 @@
     "oxlint": "^1.58.0",
     "prettier": "^3.4.2",
     "prisma": "7.10.0",
-    "source-map-support": "^0.5.21",
     "supertest": "^7.0.0",
-    "testcontainers": "^12.1.0",
     "typescript": "^6.0.2",
     "vitest": "^4.1.2"
   },
